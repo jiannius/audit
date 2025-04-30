@@ -1,6 +1,6 @@
 <?php
 
-namespace Jiannius\Audit;
+namespace Jiannius\Audit\Observers;
 
 class AuditableObserver
 {

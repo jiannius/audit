@@ -1,13 +1,14 @@
 <?php
 
-namespace Jiannius\Audit;
+namespace Jiannius\Audit\Traits;
 
 use App\Models\Audit;
 use Illuminate\Database\Eloquent\Relations\MorphMany;
+use Jiannius\Audit\Observers\AuditableObserver;
 
 trait Auditable
 {
-    public $logsCollection = [];
+    public $auditsCollection = [];
 
     protected static function bootAuditable() : void
     {

@@ -1,10 +1,10 @@
 <?php
 
-namespace Jiannius\Stripe;
+namespace Jiannius\Audit;
 
 use Illuminate\Support\ServiceProvider;
 
-class StripeServiceProvider extends ServiceProvider
+class AuditServiceProvider extends ServiceProvider
 {
     // register
     public function register() : void

@@ -1,14 +1,15 @@
 <?php
 
-namespace Jiannius\Logs\Models;
+namespace Jiannius\Audit\Models;
 
+use App\Models\User;
 use Illuminate\Database\Eloquent\Concerns\HasUlids;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 
-class Log extends Model
+class Audit extends Model
 {
     use HasFactory;
     use HasUlids;
@@ -21,10 +22,10 @@ class Log extends Model
 
     public function user() : BelongsTo
     {
-        return $this->belongsTo(App\Models\User::class);
+        return $this->belongsTo(User::class);
     }
 
-    public function loggable() : MorphTo
+    public function auditable() : MorphTo
     {
         return $this->morphTo();
     }
@@ -32,7 +33,7 @@ class Log extends Model
     public function toHtml() : string
     {
         $action = (string) str($this->action)->title();
-        $subject = class_basename(get_class($this->loggable()->getRelated()));
+        $subject = class_basename(get_class($this->auditable()->getRelated()));
         $ref = $this->reference;
 
         return <<<EOL
