@@ -22,6 +22,8 @@ return new class extends Migration
             $table->string('auditable_id')->nullable();
             $table->foreignId('user_id')->constrained()->cascadeOnDelete()->cascadeOnUpdate();
             $table->timestamps();
+
+            $table->index(['auditable_type', 'auditable_id']);
         });
     }
 

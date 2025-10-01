@@ -1,6 +1,6 @@
 <?php
 
-namespace Jiannius\Audit\Models;
+namespace Jiannius\Audit;
 
 use App\Models\User;
 use Illuminate\Database\Eloquent\Concerns\HasUlids;
@@ -20,16 +20,25 @@ class Audit extends Model
         'data' => 'array',
     ];
 
+    /**
+     * Get the user that owns the audit.
+     */
     public function user() : BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
+    /**
+     * Get the auditable model that owns the audit.
+     */
     public function auditable() : MorphTo
     {
         return $this->morphTo();
     }
 
+    /**
+     * Convert the audit to a HTML string.
+     */
     public function toHtml() : string
     {
         $action = (string) str($this->action)->title();
