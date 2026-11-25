@@ -1,5 +1,8 @@
 <?php
 
+// jiannius/audit v1
+// The line above, on a line of its own, marks this file as the v1 migration. Keep it in your published copy.
+
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;

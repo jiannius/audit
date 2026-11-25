@@ -7,6 +7,7 @@ use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskStarting;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Foundation\CachesConfiguration;
 use Illuminate\Log\Context\Repository as ContextRepository;
 use Illuminate\Queue\Events\JobExceptionOccurred;
@@ -17,7 +18,12 @@ use Illuminate\Routing\Events\RouteMatched;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
+use InvalidArgumentException;
+use Jiannius\Audit\Console\PruneCommand;
+use Jiannius\Audit\Console\PurgeCommand;
 use Jiannius\Audit\Context\AuditContext;
+use Jiannius\Audit\Contracts\FormatsAuditValues;
+use Jiannius\Audit\Retention\PruneSchedule;
 
 class AuditServiceProvider extends ServiceProvider
 {
@@ -29,6 +35,9 @@ class AuditServiceProvider extends ServiceProvider
         $this->app->singleton(Recorder::class);
         $this->app->singleton(AuditObserver::class);
         $this->app->singleton(Auditor::class);
+
+        // The formatter the CSV export uses unless it is given another. Rebind it to swap it in one place.
+        $this->app->bind(FormatsAuditValues::class, fn ($app) => $app->make(config('audit.formatter')));
     }
 
     public function boot(): void
@@ -39,18 +48,55 @@ class AuditServiceProvider extends ServiceProvider
             ], 'audit-config');
 
             // The host owns this migration: it adds its scope columns and controls every ALTER.
-            // Publish once: while a create_audits_table migration exists, publishing again leaves it alone.
-            $existing = glob(database_path('migrations/*_create_audits_table.php'));
-            $target = $existing[0] ?? database_path('migrations/'.date('Y_m_d_His').'_create_audits_table.php');
-
             $this->publishesMigrations([
-                __DIR__.'/../database/migrations/create_audits_table.php.stub' => $target,
+                __DIR__.'/../database/migrations/create_audits_table.php.stub' => static::publishedMigrationPath(database_path('migrations')),
             ], 'audit-migrations');
+
+            $this->commands([PruneCommand::class, PurgeCommand::class]);
         }
 
         $this->registerContextHooks();
         $this->registerSourceListeners();
         $this->registerSignInListeners();
+        $this->registerPruneSchedule();
+    }
+
+    /**
+     * Schedule `audit:prune` from `audit.prune.schedule`, so the host only needs `schedule:run` in cron.
+     * The config is read when the schedule is resolved, so a cached config is honoured and `null` schedules nothing.
+     *
+     * A schedule that cannot be read is reported and nothing is registered: a typo in this one key must not
+     * take down every scheduled task and `schedule:run` with it. `audit:prune` itself fails loudly on it.
+     */
+    private function registerPruneSchedule(): void
+    {
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
+            try {
+                PruneSchedule::register($schedule);
+            } catch (InvalidArgumentException $e) {
+                report($e);
+            }
+        });
+    }
+
+    /** The line the published v1 migration carries, so it can be told from any other `create_audits_table` migration. */
+    public const MIGRATION_MARKER = '// jiannius/audit v1';
+
+    /**
+     * Where `vendor:publish` puts the migration: the v1 migration the host already published, so publishing
+     * twice leaves it alone, or else a new file. A `create_audits_table` migration of the pre-1.0 package is not
+     * the v1 one and is never reused, or publishing would skip the v1 table.
+     */
+    public static function publishedMigrationPath(string $directory): string
+    {
+        foreach (glob(rtrim($directory, '/').'/*_create_audits_table.php') ?: [] as $file) {
+            // The marker on a line of its own: a comment that merely quotes it does not count.
+            if (preg_match('/^'.preg_quote(self::MIGRATION_MARKER, '/').'[ \t]*\r?$/m', (string) file_get_contents($file)) === 1) {
+                return $file;
+            }
+        }
+
+        return rtrim($directory, '/').'/'.date('Y_m_d_His').'_create_audits_table.php';
     }
 
     /** Carry the actor and request id into queued jobs through hidden Context. */
