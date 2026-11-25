@@ -40,7 +40,7 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 - Snapshot the actor (who), the record label and any host scope columns (for example a tenant) on every row, so a row stays readable after the user or the record is gone.
 - Carry the actor and request id into queued jobs.
 - Fail closed: the audit insert is synchronous, on the same connection and inside the same transaction as the change it records. A change without its row is not committed.
-- Never store secrets: passwords, tokens, encrypted and hidden attributes are excluded or redacted by default.
+- Keep the usual secrets out of rows by default: passwords, tokens, API keys, and encrypted, hashed and hidden attributes are excluded or redacted. This is a safety net with sensible defaults, not a guarantee: see [section 3](#3-auditing-a-model) for what it does not cover.
 - Work under `Model::shouldBeStrict()` and `Relation::enforceMorphMap()`, with ULID and bigint keys.
 - Keep or prune rows by category, with overrides per record type and event.
 
@@ -128,13 +128,15 @@ Every model that uses `Auditable` needs a morph-map alias ([section 2](#2-instal
 | `force_deleted` | the full raw snapshot | none | none |
 | `restored` | the changed keys (`deleted_at` before) | the changed keys (`deleted_at` after) | none |
 
-- Values are **raw database values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers.
+Any row whose old or new value was replaced by the truncation marker also has `meta.truncated`, the list of those fields ([section 9](#9-failure-behaviour)).
+
+- Values are **raw values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers, and PHP booleans are stored as `1` and `0`, as the database holds them. `old_values` come from the database. `new_values` are what the model holds after the save, as it was assigned, so a few casts differ in shape from what you would read back: a `decimal` column assigned a float stays a float (and one read from the database is a string), and an integer column assigned `'5'` stays `'5'`. Compare values by meaning, not by type.
 - A string value over `audit.max_value_bytes` is stored as the marker `"[truncated N bytes]"`, so a large attribute never blocks a save ([section 9](#9-failure-behaviour)).
 - `created` stores the attributes the model held when it was inserted. A column the database fills in by default is not in it.
 - `restore()` writes **one** `restored` row, not an extra `updated` one, and writes it inside the save, so it is as atomic as any other change.
 - `forceDelete()` writes one `force_deleted` row. It is recorded when `auditEvents()` lists `deleted` or `force_deleted`.
 - `saveQuietly()`, `updateQuietly()` and `withoutEvents()` fire no model events, so they write no row. Use the helpers in [section 4](#4-writes-that-skip-events).
-- `increment()` and `decrement()` fire `updated`, so they are recorded.
+- `increment()`, `decrement()` and `incrementEach()` fire `updated`, so they are recorded.
 - A save with no changes left after excludes writes **no row**: touch-only saves, remember-token cycling and excluded-only changes are skipped. A change from `null` to `null` (an attribute that was never loaded, now set to `null`) is not a change either.
 - Every row has the category `record`.
 
@@ -164,17 +166,20 @@ public function auditEvents(): array;             // ['created', 'updated', 'del
   ```
 
   The class must have a morph alias. With no id (`null` or empty) the row has no parent. You can also return a model you already hold.
-- **Exclude and redact** are added to the lists in config (`attributes.exclude`, `attributes.redact`). Both take glob patterns: `'internal_*'`, `'*_token'`.
+- **Exclude and redact** are added to the lists in config (`attributes.exclude`, `attributes.redact`). Both take glob patterns: `'internal_*'`, `'*_token'`. The model's own `created_at` and `updated_at` columns are excluded under whatever names it gives them.
 - **`auditEvents()`** narrows a noisy model, for example `['deleted']` for attachments. `deleted` also covers `force_deleted`.
 - **Scope columns** are filled by your resolvers ([section 8](#8-multi-tenant)). They receive the `PendingAudit`, whose `subject` is the model, so a resolver can read it. Read it with `getAttributes()`, like your overrides.
 
 **Secrets, on by default**
 
-- `password` is stored as `"[redacted]"`.
+- `password`, `api_key`, `*_api_key`, `secret_key`, `private_key` and `token` are stored as `"[redacted]"`, so the change is still visible. There is deliberately no broad `*_key` pattern: it would also hide `foreign_key` and `sort_key`.
 - `remember_token`, `*_token`, `*_secret` and `two_factor_recovery_codes` are excluded entirely: not stored, and a save that changes only those writes no row.
-- Attributes in the model's `$hidden` (`attributes.redact_hidden`) and attributes cast `encrypted`, `encrypted:*`, `hashed` or `AsEncrypted*` (`attributes.redact_encrypted`) are redacted automatically.
+- Attributes in the model's `$hidden` (`attributes.redact_hidden`) stay redacted whatever the instance does: the class's own `$hidden` always counts, so `makeVisible()` and `setHidden([])` do not un-redact them. `$visible` is a display whitelist, not a redaction source. Attributes cast `encrypted`, `encrypted:*`, `hashed` or `AsEncrypted*` (`attributes.redact_encrypted`) are redacted automatically too.
 - A redacted attribute that is `null` stays `null`, so a row still shows that a value was set or cleared, never what it was.
 - Excluding wins over redacting.
+- **The record label follows the same rules.** `subject_label` skips any label attribute that is excluded, redacted, hidden or cast encrypted or hashed, so a label cannot leak what the values do not. If you override `auditLabel()`, keeping secrets out of it is yours to do.
+
+**What this does not cover.** The rules work on attribute names and casts. A secret inside a JSON column (for example a `settings` array holding a token) is stored as it is, unless you redact the whole column with `auditRedact()`. A secret in an attribute with an unremarkable name, and one in an overridden `auditLabel()`, are not caught either. Review what your models store.
 
 **Reading the trail**
 
@@ -202,9 +207,17 @@ public function save(array $options = [])
 }
 ```
 
-The same goes for an overridden `delete()`: alias it as `auditableDelete`. The `AuditCoverage::assertTransactional()` test helper flags models that override either without the alias ([section 12](#12-testing-your-app)).
+The same goes for an overridden `delete()`: alias it as `auditableDelete`. The `AuditCoverage::assertTransactional()` test helper (P5) flags models that override either without the alias ([section 12](#12-testing-your-app)).
 
-`increment()` and `decrement()` do not call `save()`, so they are atomic only inside your own transaction.
+`increment()`, `decrement()` and `incrementEach()` are wrapped in the same transaction, so their row commits or rolls back with them. `incrementQuietly()` fires no events, so it writes no row.
+
+**After a failed audit insert** the database has rolled back, and the package puts the model back as it was before the call: `exists`, `wasRecentlyCreated`, the attributes and originals, the trashed state and the force-deleting flag. A retry of `save()` then does the right thing instead of updating a row that does not exist.
+
+**The wrapper is skipped when it cannot matter.** A model whose `auditEvents()` does not include any event the operation can fire (a `save()` on a model that records only `deleted`) is saved without a transaction.
+
+**Host traits.** A trait of your own that defines `save()` or `delete()` collides with the one in `Auditable` (a fatal error at class load). Alias the package's methods in the `use` block, as above, and call them from yours.
+
+**Tests.** Under `Event::fake()` (or `Model::withoutEvents()`) no model events fire, so no rows are written. Fake only the events you mean to, or use `Event::fakeExcept([...])`, in tests that assert on audit rows.
 
 ---
 
@@ -451,7 +464,7 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 
 | Write path | Change and row atomic? | When the audit insert fails |
 |---|---|---|
-| `Auditable` `save()`, `delete()`, `restore()` with `transactional_saves` on (default) | yes | the change rolls back and the exception is raised |
+| `Auditable` `save()`, `delete()`, `restore()`, `increment()`, `decrement()` with `transactional_saves` on (default) | yes | the change rolls back and the exception is raised |
 | Same, with `transactional_saves` off | only inside your transaction | exception; without your transaction the change stands |
 | `Auditable` model that overrides `save()` without the alias | only inside your transaction | exception after commit (a gap; `assertTransactional` catches it) |
 | `Auditor::update`, `delete`, `pivot`; `updateQuietlyWithAudit` | yes (own transaction) | rolled back |
@@ -463,14 +476,13 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 
 - A missing `audits` table blocks saves on audited models. Deploy the migration before, or with, the code that adds `Auditable`.
 - An exception in a `saved` hook now rolls the save back when `transactional_saves` is on. Run your full suite when you adopt it; the config switch is the off ramp.
-- `Model::increment()` and `decrement()` do not call `save()`, so they are not wrapped.
 
 **What the exception holds.** A failed insert throws `Jiannius\Audit\Exceptions\AuditWriteFailed`. It carries the table name, the SQLSTATE and the driver's error code, and nothing else: the database exception's own message holds the full SQL with every bound value (labels, emails, IPs), so it is not chained as `previous`. It still propagates, so a surrounding transaction rolls back, and an error Laravel treats as retryable (a deadlock, a MySQL lock wait timeout, a busy SQLite file) stays retryable for `DB::transaction($callback, $attempts)`: the exception then also carries a canned phrase Laravel's concurrency detector recognises, never a value. An invalid category throws `InvalidArgumentException` before any insert.
 
 **Sanitising.** An awkward value must never block a legitimate save:
 
 - non-UTF-8 strings are stored as `"[binary N bytes]"`;
-- a string in `old_values`, `new_values` or `meta` over `audit.max_value_bytes` (default 65,536 bytes) is stored as the marker `"[truncated N bytes]"`, with its size and none of its content;
+- a string in `old_values`, `new_values` or `meta` over `audit.max_value_bytes` (default 65,536 bytes) is stored as the marker `"[truncated N bytes]"`, with its size and none of its content. A row whose old or new values hold such a marker also gets `meta.truncated`, the list of those fields, so an update whose old and new values read the same is explained. No hash of the content is stored;
 - values that cannot be JSON-encoded (for example nesting beyond 512 levels) are stored as the marker `{"_audit": "[values could not be encoded]"}`, never as null;
 - NaN and infinite floats, resources and unknown objects are stored as short placeholders; enums store their backing value and dates their database string;
 - labels, source and identifiers are truncated to their column sizes, by character;
@@ -637,8 +649,8 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 | `transactional_saves` | `true` | Wrap `Auditable` `save()` and `delete()` in a transaction with their row. Off for hosts that cannot accept saved-hook rollbacks |
 | `model` | `Jiannius\Audit\Audit::class` | Your own subclass, for example to add scopes. Rows are always inserted by the `Recorder` |
 | `max_value_bytes` | `65536` | A string in old/new/meta over this many bytes is stored as `"[truncated N bytes]"`. `0` turns the cap off |
-| `attributes.exclude` | `created_at`, `updated_at`, `remember_token`, `*_token`, `*_secret`, `two_factor_recovery_codes` | Never stored, never count as a change. Glob patterns |
-| `attributes.redact` | `['password']` | Stored as `"[redacted]"` |
+| `attributes.exclude` | `created_at`, `updated_at`, `remember_token`, `*_token`, `*_secret`, `two_factor_recovery_codes` | Never stored, never count as a change. Glob patterns. The model's own timestamp columns are added automatically |
+| `attributes.redact` | `password`, `api_key`, `*_api_key`, `secret_key`, `private_key`, `token` | Stored as `"[redacted]"`. Glob patterns |
 | `attributes.redact_hidden` | `true` | Redact attributes in the model's `$hidden` |
 | `attributes.redact_encrypted` | `true` | Redact `encrypted*`, `hashed` and `AsEncrypted*` casts |
 | `attributes.label` | `name`, `title`, `number`, `code`, `email` | The first filled attribute is the `subject_label` snapshot |
