@@ -9,12 +9,6 @@ use Jiannius\Audit\AuditObserver;
 use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\Document;
 
-/** Every audit row, as one string, so a secret can be searched for anywhere in any column. */
-function everythingAudited(): string
-{
-    return DB::table('audits')->get()->map(fn ($row) => json_encode($row))->implode("\n");
-}
-
 function makeAuditedUser(array $attributes = []): AuditedUser
 {
     return AuditedUser::create($attributes + [

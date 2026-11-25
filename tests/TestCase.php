@@ -21,12 +21,14 @@ use Jiannius\Audit\Tests\Fixtures\AuditedLine;
 use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\CurrentTeam;
 use Jiannius\Audit\Tests\Fixtures\Document;
+use Jiannius\Audit\Tests\Fixtures\HiddenPinDocument;
 use Jiannius\Audit\Tests\Fixtures\Invoice;
 use Jiannius\Audit\Tests\Fixtures\InvoiceLine;
 use Jiannius\Audit\Tests\Fixtures\LoggedDocument;
 use Jiannius\Audit\Tests\Fixtures\Order;
 use Jiannius\Audit\Tests\Fixtures\RecordActorJob;
 use Jiannius\Audit\Tests\Fixtures\RecordCommand;
+use Jiannius\Audit\Tests\Fixtures\StampedRecord;
 use Jiannius\Audit\Tests\Fixtures\Team;
 use Jiannius\Audit\Tests\Fixtures\UnwrappedDocument;
 use Jiannius\Audit\Tests\Fixtures\User;
@@ -53,6 +55,8 @@ abstract class TestCase extends Orchestra
             'audited-user' => AuditedUser::class,
             'attachment' => Attachment::class,
             'document' => Document::class,
+            'hidden-pin-document' => HiddenPinDocument::class,
+            'stamped' => StampedRecord::class,
             'logged-document' => LoggedDocument::class,
             'unwrapped-document' => UnwrappedDocument::class,
         ]);
@@ -179,6 +183,14 @@ abstract class TestCase extends Orchestra
         });
 
         $this->createDocumentsTable();
+
+        Schema::create('stamped_records', function (Blueprint $table) {
+            $table->id();
+            $table->string('title')->nullable();
+            $table->boolean('active')->default(false);
+            $table->dateTime('added_at')->nullable();
+            $table->dateTime('modified_at')->nullable();
+        });
 
         Schema::create('jobs', function (Blueprint $table) {
             $table->id();

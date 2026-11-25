@@ -4,6 +4,7 @@ namespace Jiannius\Audit;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use WeakMap;
 
 /**
@@ -13,12 +14,12 @@ use WeakMap;
  */
 class AuditObserver
 {
-    public const REDACTED = '[redacted]';
+    public const REDACTED = AttributeRules::REDACTED;
 
     /** Models between restoring and restored, so the save in between records one row, not two. */
     private static ?WeakMap $restoring = null;
 
-    public function __construct(private Recorder $recorder) {}
+    public function __construct(private Recorder $recorder, private AttributeRules $rules) {}
 
     public function created(Model $model): void
     {
@@ -85,27 +86,13 @@ class AuditObserver
     /** Apply the exclude and redact rules to a set of raw attributes. */
     public function values(Model $model, array $attributes): array
     {
-        $exclude = $this->excludePatterns($model);
-        $redact = $this->redactPatterns($model);
-        $values = [];
-
-        foreach ($attributes as $key => $value) {
-            $key = (string) $key;
-
-            if (Str::is($exclude, $key)) {
-                continue;
-            }
-
-            $values[$key] = $value !== null && Str::is($redact, $key) ? self::REDACTED : $value;
-        }
-
-        return $values;
+        return $this->rules->values($model, $attributes);
     }
 
     /** @param  array<string, mixed>  $changes */
     private function writeChanges(Model $model, string $event, array $changes): void
     {
-        $exclude = $this->excludePatterns($model);
+        $exclude = $this->rules->excludePatterns($model);
         $keys = array_values(array_filter(array_keys($changes), fn ($key) => ! Str::is($exclude, (string) $key)));
 
         // Touch-only, token-only and excluded-only saves leave nothing to record.
@@ -116,6 +103,9 @@ class AuditObserver
         $previous = $model->getPrevious();
         $attributes = $model->getAttributes();
 
+        // A restore always records the deleted_at change, even when it was not selected and so reads null before.
+        $always = $event === 'restored' && method_exists($model, 'getDeletedAtColumn') ? [$model->getDeletedAtColumn()] : [];
+
         $old = $new = [];
 
         foreach ($keys as $key) {
@@ -123,7 +113,7 @@ class AuditObserver
             $after = $attributes[$key] ?? null;
 
             // null to null is not a change: an attribute that was never loaded or set, now set to null.
-            if ($before === null && $after === null) {
+            if ($before === null && $after === null && ! in_array($key, $always, true)) {
                 continue;
             }
 
@@ -185,8 +175,12 @@ class AuditObserver
 
         [$class, $id] = array_values($parent) + [null, null];
 
-        if (! is_string($class) || $id === null || $id === '') {
+        if ($id === null || $id === '') {
             return null;
+        }
+
+        if (! is_string($class) || ! is_subclass_of($class, Model::class)) {
+            throw new InvalidArgumentException(sprintf('%s::auditParent() must return a model or [ModelClass::class, $id]; [%s] is not an Eloquent model.', $model::class, is_string($class) ? $class : get_debug_type($class)));
         }
 
         // A bare model holding only the key is enough to resolve the type and id.
@@ -194,40 +188,5 @@ class AuditObserver
         $shell->setAttribute($shell->getKeyName(), $id);
 
         return $shell;
-    }
-
-    /** @return list<string> */
-    private function excludePatterns(Model $model): array
-    {
-        return array_values(array_merge((array) config('audit.attributes.exclude', []), $model->auditExclude()));
-    }
-
-    /** @return list<string> */
-    private function redactPatterns(Model $model): array
-    {
-        $patterns = array_merge((array) config('audit.attributes.redact', []), $model->auditRedact());
-
-        if (config('audit.attributes.redact_hidden', true)) {
-            $patterns = array_merge($patterns, $model->getHidden());
-        }
-
-        if (config('audit.attributes.redact_encrypted', true)) {
-            foreach ($model->getCasts() as $key => $cast) {
-                if ($this->isSecretCast($cast)) {
-                    $patterns[] = (string) $key;
-                }
-            }
-        }
-
-        return array_values($patterns);
-    }
-
-    /** encrypted, encrypted:array, hashed, AsEncryptedArrayObject and friends. */
-    private function isSecretCast(mixed $cast): bool
-    {
-        $name = is_object($cast) ? $cast::class : (is_string($cast) ? $cast : '');
-        $name = strtolower(class_basename(Str::before($name, ':')));
-
-        return str_starts_with($name, 'encrypted') || str_starts_with($name, 'asencrypted') || $name === 'hashed';
     }
 }

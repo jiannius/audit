@@ -13,7 +13,7 @@ return [
 
     'attributes' => [
         'exclude' => ['created_at', 'updated_at', 'remember_token', '*_token', '*_secret', 'two_factor_recovery_codes'],
-        'redact' => ['password'],
+        'redact' => ['password', 'api_key', '*_api_key', 'secret_key', 'private_key', 'token'],
         'redact_hidden' => true,
         'redact_encrypted' => true,
         'label' => ['name', 'title', 'number', 'code', 'email'],

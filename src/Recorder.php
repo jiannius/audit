@@ -67,7 +67,7 @@ class Recorder
             'user_agent' => $this->limitBytes($context->userAgent(), self::TEXT_BYTES),
             'old_values' => $this->encode($audit->old),
             'new_values' => $this->encode($audit->new),
-            'meta' => $this->encode($audit->meta),
+            'meta' => $this->encode($this->withTruncated($audit)),
             'created_at' => now()->format('Y-m-d H:i:s'),
         ];
 
@@ -83,6 +83,48 @@ class Recorder
 
             throw new AuditWriteFailed($table, $sqlState, $driverCode, $retryable);
         }
+    }
+
+    /**
+     * The audit's meta, with the fields whose old or new value was replaced by a truncation marker,
+     * so an update whose old and new both read "[truncated N bytes]" is not mistaken for no change.
+     *
+     * @return array<string, mixed>
+     */
+    private function withTruncated(PendingAudit $audit): array
+    {
+        $cap = (int) config('audit.max_value_bytes', 65536);
+
+        if ($cap <= 0) {
+            return $audit->meta;
+        }
+
+        $fields = [];
+
+        foreach ([$audit->old, $audit->new] as $values) {
+            foreach ($values as $field => $value) {
+                if ($this->exceedsCap($value, $cap)) {
+                    $fields[(string) $field] = true;
+                }
+            }
+        }
+
+        return $fields === [] ? $audit->meta : [...$audit->meta, 'truncated' => array_keys($fields)];
+    }
+
+    private function exceedsCap(mixed $value, int $cap): bool
+    {
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if ($this->exceedsCap($item, $cap)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return is_string($value) && strlen($value) > $cap && mb_check_encoding($value, 'UTF-8');
     }
 
     /** The label snapshot: the model's own auditLabel() when it has one, else the default. */
@@ -101,9 +143,11 @@ class Recorder
     public function defaultLabel(Model $model): ?string
     {
         $attributes = $model->getAttributes();
+        $rules = app(AttributeRules::class);
 
         foreach ((array) config('audit.attributes.label', []) as $key) {
-            if (! array_key_exists($key, $attributes)) {
+            // A label is a stored copy of an attribute: it follows the same exclude and redact rules.
+            if (! array_key_exists($key, $attributes) || $rules->isSecret($model, (string) $key)) {
                 continue;
             }
 

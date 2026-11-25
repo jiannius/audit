@@ -11,17 +11,6 @@ use Jiannius\Audit\Tests\Fixtures\DocumentStatus;
 
 afterEach(fn () => Carbon::setTestNow());
 
-function makeDocument(array $attributes = []): Document
-{
-    return Document::create($attributes + [
-        'title' => 'Quarterly report',
-        'status' => DocumentStatus::Draft,
-        'placed_at' => Carbon::parse('2026-01-02 03:04:05'),
-        'options' => ['colour' => 'red'],
-        'total' => 100,
-    ]);
-}
-
 describe('created', function () {
     it('records the raw attributes that were inserted', function () {
         $document = makeDocument();
@@ -238,8 +227,8 @@ describe('restored', function () {
         expect($this->audits()->pluck('event')->all())->toBe(['created', 'deleted', 'restored', 'updated']);
     });
 
-    it('writes nothing for a restore of a record that is not trashed', function () {
-        $document = makeDocument();
+    it('writes nothing for a restore of a loaded record that is not trashed', function () {
+        $document = Document::query()->findOrFail(makeDocument()->id);
 
         $document->restore();
 

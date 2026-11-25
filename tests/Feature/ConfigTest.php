@@ -14,7 +14,7 @@ it('keeps the other defaults when a published config is partial', function () {
 
     expect(config('audit.actor'))->toBe(['name' => 'name', 'identifier' => 'username', 'context_key' => null])
         ->and(config('audit.attributes.exclude'))->toBe(['only_this'])
-        ->and(config('audit.attributes.redact'))->toBe(['password'])
+        ->and(config('audit.attributes.redact'))->toBe(['password', 'api_key', '*_api_key', 'secret_key', 'private_key', 'token'])
         ->and(config('audit.attributes.redact_hidden'))->toBeTrue()
         ->and(config('audit.prune'))->toBe(['schedule' => null, 'chunk' => 1000])
         ->and(config('audit.table'))->toBe('my_audits')
