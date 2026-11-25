@@ -460,3 +460,56 @@ describe('outside a Laravel app', function () {
         expect(shell_exec(escapeshellarg(PHP_BINARY).' '.escapeshellarg($script).' 2>&1'))->toBe('[2,3]');
     });
 });
+
+describe('exemptions that must not hide a real write', function () {
+    it('flags a model that shares its name with a facade', function (string $statement) {
+        expect(guardOver("        {$statement}")->writes())->toHaveCount(1);
+    })->with([
+        'a Session model' => ["Session::where('last_activity', '<', 1)->delete();"],
+        'a namespaced Session model' => ["\\App\\Models\\Session::where('last_activity', '<', 1)->delete();"],
+        'a Cache model' => ["Cache::where('expiration', '<', 1)->delete();"],
+        'a Mail model through query()' => ['Mail::query()->delete();'],
+        'a namespaced Mail model' => ['\\App\\Models\\Mail::latest()->delete();'],
+        'a Storage model with a scope' => ['Storage::onlyTrashed()->forceDelete();'],
+        'a Redis model with find' => ['\\App\\Redis::whereIn("id", [1])->update(["a" => 1]);'],
+        'a namespaced class that only ends in Storage' => ["\\App\\Support\\Storage::disk('s3')->delete('a');"],
+    ]);
+
+    it('still exempts the real facades and their chains', function (string $statement) {
+        expect(guardOver("        {$statement}")->writes())->toBe([]);
+    })->with([
+        'Storage disk' => ["Storage::disk('s3')->delete('a');"],
+        'the facade by its full name' => ["\\Illuminate\\Support\\Facades\\Storage::disk('s3')->delete('a');"],
+        'the facade without a leading slash' => ["Illuminate\\Support\\Facades\\Cache::store('file')->delete('a');"],
+        'Http withToken' => ['Http::withToken($t)->delete($url);'],
+        'Http baseUrl' => ["Http::baseUrl('x')->withHeaders([])->delete('/a');"],
+        'Mail to' => ['Mail::to($user)->touch();'],
+        'Cache store' => ["Cache::store('redis')->delete('a');"],
+        'Redis connection' => ["Redis::connection('cache')->delete('a');"],
+        'Session driver' => ["Session::driver('array')->delete('a');"],
+    ]);
+
+    it('takes user() as a model only on the signed-in user\'s sources', function (string $statement) {
+        expect(guardOver("        {$statement}")->writes())->toBe([]);
+    })->with([
+        'the request' => ["\$request->user()->update(['a' => 1]);"],
+        'the request helper' => ["request()->user()->update(['a' => 1]);"],
+        'the auth helper' => ["auth()->user()->update(['a' => 1]);"],
+        'the auth helper with a guard' => ["auth('api')->user()->update(['a' => 1]);"],
+        'the guard method' => ["auth()->guard('api')->user()->update(['a' => 1]);"],
+        'the Auth facade' => ["Auth::user()->update(['a' => 1]);"],
+        'the Auth facade with a guard' => ["Auth::guard('web')->user()->update(['a' => 1]);"],
+        'the Auth facade in full' => ['\\Illuminate\\Support\\Facades\\Auth::user()->delete();'],
+    ]);
+
+    it('flags user() on anything else, which may be a relation or a scope', function (string $statement) {
+        expect(guardOver("        {$statement}")->writes())->toHaveCount(1);
+    })->with([
+        'a relation' => ["\$post->user()->update(['a' => 1]);"],
+        'a relation on this' => ['$this->user()->delete();'],
+        'a scope' => ["Order::user(1)->update(['a' => 1]);"],
+        'a namespaced Auth model' => ["\\App\\Models\\Auth::user()->update(['a' => 1]);"],
+        'a query that ends in user' => ["Order::where('a', 1)->user()->update(['a' => 1]);"],
+        'user after something else' => ["auth()->items()->user()->update(['a' => 1]);"],
+    ]);
+});

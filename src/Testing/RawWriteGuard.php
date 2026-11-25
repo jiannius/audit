@@ -37,7 +37,13 @@ final class RawWriteGuard
      * A chain `X->update()` is not a query write when X is a model: these calls return one (or the signed-in
      * user), and `$model->update()` fires the model's events.
      */
-    private const MODEL_RETURNING = ['find', 'findorfail', 'first', 'firstorfail', 'sole', 'fresh', 'refresh', 'user', 'create', 'firstorcreate', 'updateorcreate', 'firstwhere'];
+    private const MODEL_RETURNING = ['find', 'findorfail', 'first', 'firstorfail', 'sole', 'fresh', 'refresh', 'create', 'firstorcreate', 'updateorcreate', 'firstwhere'];
+
+    /** `user()` returns a model only on the signed-in user's sources: `$request`, `request()`, `auth()` and the `Auth` facade. */
+    private const USER_ROOTS = ['$request', 'request', 'auth', 'Auth'];
+
+    /** The calls an Eloquent query starts with. A facade's own chains (`Storage::disk()`, `Mail::to()`) never do. */
+    private const QUERY_STARTERS = '/\A(?:where\w*|orwhere\w*|query|newquery|on|with|withtrashed|onlytrashed|withonlytrashed|withcount|withoutglobalscope\w*|has\w*|doesnthave|latest|oldest|orderby\w*|find\w*|first\w*|all|get|select\w*|limit|take|skip|offset|join\w*|groupby|lockforupdate|sharedlock|pluck|count|exists)\z/i';
 
     /** A chain that starts at one of these facades is not an Eloquent query: a file, an HTTP call, a cache key. */
     private const NOT_QUERY_ROOTS = ['Storage', 'Http', 'Cache', 'Session', 'Redis', 'Mail'];
@@ -266,11 +272,19 @@ final class RawWriteGuard
         foreach ($matches[0] as [, $offset]) {
             $chain = self::chainBefore($text, $offset);
 
-            if ($chain !== [] && in_array(strtolower((string) end($chain)), self::MODEL_RETURNING, true)) {
+            if ($chain === []) {
+                return true;
+            }
+
+            $last = strtolower((string) end($chain));
+
+            if (in_array($last, self::MODEL_RETURNING, true) || ($last === 'user' && self::isSignedInUser($chain))) {
                 continue;
             }
 
-            if ($chain !== [] && in_array($chain[0], self::NOT_QUERY_ROOTS, true)) {
+            // A facade is exempt only when it is written as the facade, never as a model of the same name
+            // (`App\Models\Session::where(...)`), and only for a chain a facade has (`Storage::disk(...)`).
+            if (self::facade($chain[0]) !== null && in_array(self::facade($chain[0]), self::NOT_QUERY_ROOTS, true) && (! isset($chain[1]) || preg_match(self::QUERY_STARTERS, $chain[1]) !== 1)) {
                 continue;
             }
 
@@ -326,7 +340,7 @@ final class RawWriteGuard
                     $from--;
                 }
 
-                $names[] = self::lastSegment(substr($text, $from, $end - $from));
+                $names[] = substr($text, $from, $end - $from);
 
                 break;
             } else {
@@ -347,6 +361,26 @@ final class RawWriteGuard
         }
 
         return array_reverse($names);
+    }
+
+    /**
+     * Whether `...->user()` here is the signed-in user: the chain starts at `$request`, `request()`, `auth()` or
+     * the `Auth` facade, with at most a `guard()` between.
+     *
+     * @param  list<string>  $chain
+     */
+    private static function isSignedInUser(array $chain): bool
+    {
+        $root = self::facade($chain[0]) ?? $chain[0];
+        $between = array_slice($chain, 1, -1);
+
+        return in_array($root, self::USER_ROOTS, true) && ($between === [] || $between === ['guard']);
+    }
+
+    /** The facade a class name is written as: the bare name, or `Illuminate\Support\Facades\X`. A namespaced model of the same name is not it. */
+    private static function facade(string $class): ?string
+    {
+        return preg_match('/\A\\\\?(?:Illuminate\\\\Support\\\\Facades\\\\)?(\w+)\z/', $class, $matches) === 1 ? $matches[1] : null;
     }
 
     /** `\Illuminate\Support\Facades\Storage` is `Storage`. */
