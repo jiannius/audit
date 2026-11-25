@@ -11,6 +11,7 @@ use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\CentsFormatter;
 use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\Team;
+use Jiannius\Audit\Tests\Fixtures\TeamNameFormatter;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 const CSV_HEADINGS = ['Audit ID', 'Time', 'Category', 'Event', 'Record type', 'Record ID', 'Record', 'Parent type', 'Parent ID', 'Field', 'Old value', 'New value', 'User ID', 'User name', 'User identifier', 'Source', 'IP address', 'User agent', 'Request ID', 'Details'];
@@ -311,6 +312,79 @@ describe('headings and scope columns', function () {
         $rows = csvRows(CsvExport::make(Audit::query())->scopeColumns(['team_id' => 'Team'])->headings(['team_id' => 'Workspace']));
 
         expect($rows[0])->toContain('Workspace')->not->toContain('Team');
+    });
+});
+
+describe('scope values', function () {
+    it('writes what a FormatsScopeValues formatter returns, through the injection guard', function () {
+        Team::query()->create(['id' => 5, 'name' => 'Acme Ltd']);
+        Team::query()->create(['id' => 6, 'name' => '=HYPERLINK("x")']);
+        insertedAudit(['team_id' => 5, 'region_id' => 9]);
+        insertedAudit(['team_id' => 6, 'region_id' => 9]);
+        insertedAudit(['team_id' => 7]);
+        insertedAudit(['team_id' => null]);
+
+        $records = csvRecords(CsvExport::make(Audit::query())->formatter(new TeamNameFormatter)->scopeColumns(['team_id' => 'Team', 'region_id' => 'Region']));
+
+        expect(array_column($records, 'Team'))->toBe(['Acme Ltd', '\'=HYPERLINK("x")', '#7', ''])
+            ->and(array_column($records, 'Region'))->toBe(['9', '9', '', '']);
+    });
+
+    it('uses the bound formatter when it formats scope values', function () {
+        config(['audit.formatter' => TeamNameFormatter::class]);
+        Team::query()->create(['id' => 5, 'name' => 'Acme Ltd']);
+        insertedAudit(['team_id' => 5]);
+
+        expect(csvRecords(CsvExport::make(Audit::query())->scopeColumns(['team_id' => 'Team']))[0]['Team'])->toBe('Acme Ltd');
+    });
+
+    it('writes the raw value when the formatter does not format scope values', function () {
+        insertedAudit(['team_id' => 5]);
+
+        expect(csvRecords(CsvExport::make(Audit::query())->formatter(new CentsFormatter)->scopeColumns(['team_id' => 'Team']))[0]['Team'])->toBe('5');
+    });
+
+    it('prepares each batch once per scope column with its distinct values, so names load in one query per batch', function () {
+        foreach ([1 => 'One', 2 => 'Two', 3 => 'Three'] as $id => $name) {
+            Team::query()->create(['id' => $id, 'name' => $name]);
+        }
+
+        // 2,500 rows: two full batches of team 1 or 2, then a last batch that adds team 3 and a null.
+        $rows = [];
+
+        foreach (range(1, 2500) as $i) {
+            $rows[] = ['category' => 'record', 'event' => 'updated', 'team_id' => match (true) {
+                $i <= 2000 => 1 + $i % 2,
+                $i === 2500 => null,
+                default => 3,
+            }, 'created_at' => '2026-11-25 12:00:00'];
+        }
+
+        foreach (array_chunk($rows, 500) as $chunk) {
+            DB::table('audits')->insert($chunk);
+        }
+
+        $formatter = new TeamNameFormatter;
+        $teamQueries = 0;
+        DB::listen(function ($query) use (&$teamQueries) {
+            $teamQueries += str_contains($query->sql, '"teams"') || str_contains($query->sql, '`teams`') ? 1 : 0;
+        });
+
+        $records = csvRecords(CsvExport::make(Audit::query())->formatter($formatter)->scopeColumns(['team_id' => 'Team', 'region_id' => 'Region']));
+
+        $teamBatches = array_values(array_filter($formatter->prepared, fn (array $call) => $call[0] === 'team_id'));
+        $sorted = array_map(function (array $call) {
+            $values = array_map('intval', $call[1]);
+            sort($values);
+
+            return $values;
+        }, $teamBatches);
+
+        expect($records)->toHaveCount(2500)
+            ->and($sorted)->toBe([[1, 2], [1, 2], [3]])
+            ->and(array_column(array_filter($formatter->prepared, fn (array $call) => $call[0] === 'region_id'), 1))->toBe([[], [], []])
+            ->and($teamQueries)->toBe(3)
+            ->and(array_count_values(array_column($records, 'Team')))->toBe(['Two' => 1000, 'One' => 1000, 'Three' => 499, '' => 1]);
     });
 });
 

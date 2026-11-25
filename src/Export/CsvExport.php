@@ -9,6 +9,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Jiannius\Audit\Contracts\FormatsAuditValues;
+use Jiannius\Audit\Contracts\FormatsScopeValues;
 use RuntimeException;
 use Symfony\Component\HttpFoundation\HeaderUtils;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -17,7 +18,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  * A streamed, CSV-injection-safe export of the rows a query selects.
  *
  * You supply the query, so your own filters and read scopes apply. The rows are read in id order,
- * a thousand at a time, and written as they are read, so the whole result is never in memory.
+ * a thousand at a time, and each batch is written before the next is read, so the whole result is never in memory.
  * Each field of each audit row becomes one CSV row; the Audit ID column regroups them.
  */
 final class CsvExport
@@ -158,7 +159,7 @@ final class CsvExport
      * Write the BOM, the headings and every row to an open stream, for a command or a test.
      *
      * @param  resource  $handle
-     * @return int the number of data rows written, not counting the heading row
+     * @return int the number of CSV data rows written (one per field, so not the number of audit entries), not counting the heading row
      */
     public function write($handle): int
     {
@@ -178,14 +179,47 @@ final class CsvExport
         // the pages overlap or skip rows, so it is dropped: the export is in id order, whatever the query asked for.
         $query = (clone $this->query)->reorder();
 
-        foreach ($query->lazyById(self::CHUNK) as $audit) {
-            foreach ($this->rowsOf($audit->getAttributes(), $formatter, $timezone) as $row) {
-                $this->put($handle, $row);
-                $count++;
+        $query->chunkById(self::CHUNK, function ($audits) use ($handle, $formatter, $timezone, &$count) {
+            $rows = $audits->map(fn ($audit) => $audit->getAttributes())->all();
+
+            $this->prepareScopeValues($rows, $formatter);
+
+            foreach ($rows as $audit) {
+                foreach ($this->rowsOf($audit, $formatter, $timezone) as $row) {
+                    $this->put($handle, $row);
+                    $count++;
+                }
             }
-        }
+        });
 
         return $count;
+    }
+
+    /**
+     * Give a formatter that formats scope values each column's distinct values in the batch, so it can look
+     * them up in one query instead of one per row.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     */
+    private function prepareScopeValues(array $rows, FormatsAuditValues $formatter): void
+    {
+        if (! $formatter instanceof FormatsScopeValues) {
+            return;
+        }
+
+        foreach (array_keys($this->scopeColumns) as $column) {
+            $values = [];
+
+            foreach ($rows as $row) {
+                $value = $row[$column] ?? null;
+
+                if ($value !== null) {
+                    $values[get_debug_type($value).':'.$value] = $value;
+                }
+            }
+
+            $formatter->prepareScopeValues($column, array_values($values));
+        }
     }
 
     /**
@@ -250,7 +284,9 @@ final class CsvExport
             $audit['ip_address'] ?? null,
             $audit['user_agent'] ?? null,
             $audit['request_id'] ?? null,
-            ...array_map(fn (string $column) => $audit[$column] ?? null, array_keys($this->scopeColumns)),
+            ...array_map(fn (string $column) => $formatter instanceof FormatsScopeValues
+                ? $formatter->scopeValue($column, $audit[$column] ?? null)
+                : $audit[$column] ?? null, array_keys($this->scopeColumns)),
             $this->details($audit['meta'] ?? null),
         ];
 

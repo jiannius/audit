@@ -2,7 +2,7 @@
 
 A small, generic audit trail for Laravel 13. It has no UI and no dependency beyond the Laravel framework itself.
 
-> **Status: v1.0.0.** The package was built in five phases, and every one of them is in the code.
+> **Status: v1.1.0.** v1.0.0 was built in five phases, and every one of them is in the code. Later changes are in the [changelog](#changelog).
 >
 > | Phase | Tag | Delivers | State |
 > |---|---|---|---|
@@ -27,6 +27,7 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 - [13. Config reference](#13-config-reference)
 - [14. Production checklist](#14-production-checklist)
 - [15. Upgrading from the pre-1.0 package](#15-upgrading-from-the-pre-10-package)
+- [Changelog](#changelog)
 
 ---
 
@@ -756,10 +757,10 @@ CsvExport::make(Audit::query()->between($from, $to))
 | `CsvExport::make(Builder\|Relation $query)` | The rows to export: any Eloquent builder over the audits, with your own filters applied. A builder over a [read scope](#8-multi-tenant) stays inside it |
 | `->formatter(FormatsAuditValues $formatter)` | Default: `app(FormatsAuditValues::class)`, which the package binds to `audit.formatter` |
 | `->timezone(DateTimeZone\|string\|null $timezone)` | The timezone of the Time column. Default: the application's, which is what rows are stored in |
-| `->scopeColumns(array $columns)` | Your scope columns, written after Request ID: `['team_id' => 'Team']`, or `['team_id']` for a heading made from the column name. A column named like one of the export's own keys (`id`, `source`, `details` ...) throws, because one of the two would be dropped |
+| `->scopeColumns(array $columns)` | Your scope columns, written after Request ID: `['team_id' => 'Team']`, or `['team_id']` for a heading made from the column name. Written raw (the id), or through your formatter when it also implements [`FormatsScopeValues`](#scope-values). A column named like one of the export's own keys (`id`, `source`, `details` ...) throws, because one of the two would be dropped |
 | `->headings(array $headings)` | Replace a heading, by the column's key (below). An unknown key throws, listing the valid ones |
 | `->download(string $filename, array $headers = [])` | A `StreamedResponse` for a controller: `text/csv; charset=UTF-8`, an attachment, `Cache-Control: no-store, private`. Slashes and control characters in the name are replaced |
-| `->write($handle): int` | Writes the BOM, the headings and every row to an open stream, and returns the number of data rows (not counting the heading row) |
+| `->write($handle): int` | Writes the BOM, the headings and every row to an open stream, and returns the number of CSV data rows (not counting the heading row). That is one per field, so not the number of audit entries |
 
 ```php
 interface FormatsAuditValues
@@ -772,9 +773,39 @@ interface FormatsAuditValues
 
 Set your implementation in `audit.formatter`, or rebind `FormatsAuditValues` in a service provider. The default `RawFormatter` uses headline field names (`placed_at` becomes `Placed At`), scalars as they are, arrays as JSON and `null` as blank.
 
-- `value()` receives the **raw** stored value: a scalar, `null`, or an array (a JSON column, or a pivot field). A field that only one side of the row has (a create has no old value) is passed as `null` for the other side, so guard it (`$raw === null ? null : $raw / 100`). A row without a subject, such as a sign-in, has an empty `$subjectType`.
+- `value()` receives the **raw** stored value: a scalar, `null`, or an array (a pivot field). A **JSON-cast column** arrives as JSON text (`'{"theme":"dark"}'`), a string, not an array, because values are recorded without casts ([section 3](#3-auditing-a-model)); `json_decode()` it if you want to show it differently. Its spacing and key order can differ by database. A field that only one side of the row has (a create has no old value) is passed as `null` for the other side, so guard it (`$raw === null ? null : $raw / 100`). A row without a subject, such as a sign-in, has an empty `$subjectType`.
 - A **pivot field** arrives in one of the two shapes [section 4](#pivot-changes) describes: a list of related ids, with an id linked twice repeated (`[1, 1, 2]`), or, for a relation declared with `withPivot()`, a map of id to its columns, or to a list of column sets when an id is linked twice (`{"1": {"role": "admin"}}`). `RawFormatter` writes both as JSON in one cell of the old and new columns; a formatter can turn them into something readable.
 - A returned `bool` is written as `true` or `false`, and `null` as a blank cell.
+
+<a id="scope-values"></a>**Scope values.** Scope columns hold ids, so by default the file shows `5` where a reader wants `Acme Ltd`. To write names, have your formatter also implement the optional `FormatsScopeValues`:
+
+```php
+use Jiannius\Audit\Contracts\FormatsScopeValues;
+use Jiannius\Audit\Export\RawFormatter;
+
+class AuditFormatter extends RawFormatter implements FormatsScopeValues
+{
+    private array $names = [];
+
+    // Before each batch of rows, once per scope column, with the batch's distinct non-null values (possibly none).
+    public function prepareScopeValues(string $column, array $raw): void
+    {
+        if ($column === 'team_id' && $raw !== []) {
+            $this->names = Team::query()->whereIn('id', $raw)->pluck('name', 'id')->all();
+        }
+    }
+
+    // Once per audit entry, null included. A null result is a blank cell.
+    public function scopeValue(string $column, mixed $raw): string|int|float|bool|null
+    {
+        return $column === 'team_id' && $raw !== null ? ($this->names[$raw] ?? $raw) : $raw;
+    }
+}
+```
+
+- The export reads a thousand rows at a time and calls `prepareScopeValues()` before writing each batch, so names load in one query per batch and scope column, not one per row. Keep only what the current batch needs, or keep a memo across batches if the set is small; the formatter is resolved once per export.
+- A formatter without the interface is unchanged: scope cells are written raw, as before.
+- What `scopeValue()` returns goes through the same CSV-injection guard as every other cell.
 
 **Rows: one per field.** An update gives one row per changed field; a create or delete one row per stored field; an event with no values, such as a sign-in or a `sent` event, one row with blank field columns. The Audit ID column regroups rows into entries. The order of fields within an entry is the order the database returns the JSON keys in, which is sorted on MySQL.
 
@@ -794,12 +825,13 @@ Set your implementation in `audit.formatter`, or rebind `FormatsAuditValues` in 
 | `old_value`, `new_value` | Old value, New value | Through `value()` |
 | `actor_id`, `actor_name`, `actor_identifier` | User ID, User name, User identifier | The snapshots |
 | `source`, `ip_address`, `user_agent`, `request_id` | Source, IP address, User agent, Request ID | |
-| your scope columns | the heading you gave | One per key of `scopeColumns()` |
+| your scope columns | the heading you gave | One per key of `scopeColumns()`; through `scopeValue()` when the formatter implements `FormatsScopeValues`, raw otherwise |
 | `details` | Details | `meta` as JSON, repeated on every row of the entry. It holds `_truncated` when a value was replaced by `"[truncated N bytes]"` |
 
-- **Streams.** The rows are read through `lazyById(1000)`, in `id` order, and written as they go, so memory does not grow with the result. The query's own `orderBy()` is dropped (paging by id cannot honour it without skipping or repeating rows), so sort the file afterwards if you need another order. For the same reason a query with `limit()` or `offset()` throws `InvalidArgumentException` (`latest()->limit(100)` would export the hundred lowest ids): filter by a date or id range instead. The query must select every column (no partial `select()`).
+- **Streams.** The rows are read through `chunkById(1000)`, in `id` order, and each batch is written before the next is read, so memory does not grow with the result. The query's own `orderBy()` is dropped (paging by id cannot honour it without skipping or repeating rows), so sort the file afterwards if you need another order. For the same reason a query with `limit()` or `offset()` throws `InvalidArgumentException` (`latest()->limit(100)` would export the hundred lowest ids): filter by a date or id range instead. The query must select every column (no partial `select()`).
 - Starts with a UTF-8 BOM, so Excel reads the encoding correctly. Cells are written with `fputcsv` and an empty escape character.
 - **CSV-injection safety:** a string cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`. This covers every text cell, including the record label, the user's name and what your formatter returns. Numbers (PHP `int` and `float`) are written as they are, and so is a string that is only a plain decimal number (`-150.00`, matching `-?\d+(\.\d+)?`), so a decimal column's value keeps its sign. Anything else that starts with one of those characters is prefixed: `-2+3`, `-1e5`, `+60123456789`, `=1`.
+- **Large exports: stream from a route.** Return `->download()` from a controller route and link to it, so the file streams to the browser. A handler that buffers the response, such as a Livewire action that returns a download, holds the whole file in memory (Livewire also base64-encodes it) before it is sent, which defeats the streaming for a large export.
 - An export is a sensitive file. You control who may run it.
 
 ---
@@ -893,6 +925,8 @@ expect(Jiannius\Audit\Audit::forSubject($invoice)->pluck('event')->all())->toBe(
 
 **Compare JSON by meaning, not by key order.** MySQL's `json` type reorders object keys ([section 2](#2-install)), so a test that compares a multi-key `meta`, `old_values` or `new_values` with `toBe()` or `assertSame()` passes on SQLite and fails on MySQL. Use `toEqual()`, `assertEquals()` or `assertEqualsCanonicalizing()` instead.
 
+**Audit inserts count as queries.** Every audited write adds an insert into the audits table, in the same transaction. A test that asserts a query count (with `DB::listen()`, `DB::getQueryLog()` or a query-count helper) sees those inserts too, so leave out the queries on the audits table, or count them as part of the expected number.
+
 Run your suite under `Model::shouldBeStrict()` with an enforced morph map: that is how the package's own tests run.
 
 ---
@@ -964,6 +998,20 @@ A project that needs the old code can pin the last pre-rewrite commit:
 ```json
 "require": { "jiannius/audit": "dev-main#2cc7a1a" }
 ```
+
+---
+
+## Changelog
+
+### v1.1.0 (2026-11-25)
+
+- **Readable scope columns in the CSV export.** A formatter can implement the new, optional `FormatsScopeValues` to turn scope ids into names, loaded once per thousand-row batch ([section 11](#scope-values)). A formatter without it writes raw values, as before. `FormatsAuditValues` is unchanged.
+- The export now reads with `chunkById(1000)` instead of `lazyById(1000)`. Same order, same memory bound.
+- Docs: a JSON-cast column reaches `value()` as JSON text, not an array; `write()` counts CSV rows, not audit entries; stream large exports from a route rather than a Livewire download; audit inserts count toward query-count assertions.
+
+### v1.0.0 (2026-11-25)
+
+- First release of the rewrite: see [section 15](#15-upgrading-from-the-pre-10-package).
 
 ---
 
