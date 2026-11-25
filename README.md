@@ -101,7 +101,7 @@ The table is append-only and has no foreign keys:
 | `old_values`, `new_values`, `meta` | JSON. Raw database values |
 | `created_at` | `datetime`, no `updated_at` |
 
-**Database notes.** MySQL's `json` type does not keep key order, so `old_values` and `new_values` may read back with their keys sorted. Do not rely on key order. Ids are strings so one table holds ULID and bigint subjects, and the package always binds them as strings, because comparing a varchar column to an integer defeats the index on MySQL.
+**Database notes.** MySQL's `json` type does not keep key order, so `old_values`, `new_values` and `meta` may read back with their keys sorted. Do not rely on key order. Ids are strings so one table holds ULID and bigint subjects, and the package always binds them as strings, because comparing a varchar column to an integer defeats the index on MySQL.
 
 ---
 
@@ -783,6 +783,8 @@ It skips statements that go through `Auditor::`. It is **biased towards false po
 ```php
 expect(Jiannius\Audit\Audit::forSubject($invoice)->pluck('event')->all())->toBe(['created', 'sent']);
 ```
+
+**Compare JSON by meaning, not by key order.** MySQL's `json` type reorders object keys ([section 2](#2-install)), so a test that compares a multi-key `meta`, `old_values` or `new_values` with `toBe()` or `assertSame()` passes on SQLite and fails on MySQL. Use `toEqual()`, `assertEquals()` or `assertEqualsCanonicalizing()` instead.
 
 Run your suite under `Model::shouldBeStrict()` with an enforced morph map: that is how the package's own tests run.
 
