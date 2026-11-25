@@ -1,0 +1,63 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function getConnection(): ?string
+    {
+        return config('audit.connection');
+    }
+
+    public function up(): void
+    {
+        $name = config('audit.table', 'audits');
+
+        // Short, explicit index names keep a long custom table name under MySQL's 64 characters.
+        // Index names are unique per database on SQLite and PostgreSQL, so they carry the table name.
+        $index = fn (string $suffix): string => substr($name, 0, 50).'_'.$suffix.'_idx';
+
+        Schema::connection($this->getConnection())->create($name, function (Blueprint $table) use ($index) {
+            $table->id();                                      // bigint: compact, monotonic, cheap "order by id desc"
+            $table->string('category', 16);                    // record | auth | action (retention group)
+            $table->string('event', 64);                       // created, updated, deleted, restored, login, voided, sent ...
+            $table->string('subject_type', 64)->nullable();    // morph alias
+            $table->string('subject_id', 64)->nullable();      // ULID or bigint, always bound as a string
+            $table->string('subject_label')->nullable();       // snapshot, truncated
+            $table->string('parent_type', 64)->nullable();     // roll-up, e.g. an invoice line's invoice
+            $table->string('parent_id', 64)->nullable();
+            $table->string('actor_type', 64)->nullable();
+            $table->string('actor_id', 64)->nullable();
+            $table->string('actor_name')->nullable();          // snapshot of config('audit.actor.name')
+            $table->string('actor_identifier')->nullable();    // snapshot of config('audit.actor.identifier'): email, username, phone ...
+
+            // Host scope columns, one per key in config('audit.scopes'). No foreign keys. For example:
+            // $table->unsignedBigInteger('team_id')->nullable();
+            // $table->index(['team_id', 'id'], $index('team'));
+
+            $table->string('source', 191)->nullable();         // web | console:<cmd> | queue:<job> | schedule:<task> | backfill:<name>
+            $table->string('request_id', 64)->nullable();
+            $table->string('ip_address', 45)->nullable();
+            $table->text('user_agent')->nullable();
+            $table->json('old_values')->nullable();            // raw db values
+            $table->json('new_values')->nullable();
+            $table->json('meta')->nullable();
+            $table->dateTime('created_at');                    // datetime, not timestamp: no 2038 ceiling for long retention
+
+            $table->index(['subject_type', 'subject_id', 'id'], $index('subject'));
+            $table->index(['parent_type', 'parent_id', 'id'], $index('parent'));
+            $table->index(['actor_type', 'actor_id', 'id'], $index('actor'));
+            $table->index(['event', 'id'], $index('event'));
+            $table->index(['category', 'created_at'], $index('category'));   // retention + category filter
+            $table->index('created_at', $index('created'));                  // date-range filter and export
+            $table->index('request_id', $index('request'));
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::connection($this->getConnection())->dropIfExists(config('audit.table', 'audits'));
+    }
+};
