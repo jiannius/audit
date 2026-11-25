@@ -1,5 +1,6 @@
 <?php
 
+use Illuminate\Database\ConcurrencyErrorDetector;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Jiannius\Audit\Audit;
@@ -56,16 +57,68 @@ describe('a failed insert', function () {
         expect(Invoice::query()->count())->toBe(0);
     });
 
-    it('keeps a deadlock recognisable to DB::transaction retries', function () {
-        $deadlock = AuditWriteFailed::from(
-            new QueryException('x', 'insert into audits', ['secret'], new PDOException('Deadlock found: secret')),
-            'audits',
-        );
-        $plain = new AuditWriteFailed('audits', '42S02', 1146);
+    it('keeps every retryable concurrency error retryable, with no value in the message', function (string $driverMessage, string $sqlState, int $driverCode) {
+        $pdo = new PDOException($driverMessage);
+        $pdo->errorInfo = [$sqlState, $driverCode, $driverMessage];
+        $original = new QueryException('conn', 'insert into audits (meta) values (?)', ['secret-value'], $pdo);
 
-        expect($deadlock->getMessage())->not->toContain('secret')
-            ->and((new AuditWriteFailed('audits', '40001', 1213))->getMessage())->toContain('Deadlock found when trying to get lock')
-            ->and($plain->getMessage())->not->toContain('Deadlock');
+        $detector = new ConcurrencyErrorDetector;
+        expect($detector->causedByConcurrencyError($original))->toBeTrue(); // the premise
+
+        $failed = AuditWriteFailed::from($original, 'audits');
+
+        expect($detector->causedByConcurrencyError($failed))->toBeTrue()
+            ->and($failed->retryable)->toBeTrue()
+            ->and($failed->getMessage())->not->toContain('secret-value')
+            ->and($failed->getMessage())->not->toContain('insert into')
+            ->and($failed->getPrevious())->toBeNull();
+    })->with([
+        'MySQL deadlock' => ['SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock', '40001', 1213],
+        'PostgreSQL deadlock' => ['SQLSTATE[40P01]: Deadlock detected: 7 ERROR: deadlock detected', '40P01', 7],
+        'MySQL lock wait timeout' => ['SQLSTATE[HY000]: General error: 1205 Lock wait timeout exceeded; try restarting transaction', 'HY000', 1205],
+        'SQLite busy' => ['SQLSTATE[HY000]: General error: 5 database is locked', 'HY000', 5],
+        'SQLite table locked' => ['SQLSTATE[HY000]: General error: 6 database table is locked', 'HY000', 6],
+    ]);
+
+    it('does not mark an ordinary failure retryable', function () {
+        $pdo = new PDOException('SQLSTATE[HY000]: General error: 1 no such table: audits');
+        $pdo->errorInfo = ['HY000', 1, 'no such table: audits'];
+
+        $failed = AuditWriteFailed::from(new QueryException('conn', 'insert into audits', [], $pdo), 'audits');
+
+        expect($failed->retryable)->toBeFalse()
+            ->and((new ConcurrencyErrorDetector)->causedByConcurrencyError($failed))->toBeFalse();
+    });
+
+    it('lets DB::transaction retry a busy audit insert', function () {
+        $attempts = 0;
+
+        DB::transaction(function () use (&$attempts) {
+            $attempts++;
+
+            if ($attempts === 1) {
+                throw new AuditWriteFailed('audits', 'HY000', 5, retryable: true);
+            }
+
+            Invoice::create(['number' => 'INV-1']);
+        }, 2);
+
+        expect($attempts)->toBe(2)
+            ->and(Invoice::query()->count())->toBe(1);
+    });
+
+    it('does not pass the original exception to a function that shows in the trace', function () {
+        ini_set('zend.exception_ignore_args', '0'); // the development default: traces keep arguments
+        DB::statement('drop table audits');
+
+        try {
+            Auditor::record('sent', meta: ['note' => 'top-secret-note']);
+        } catch (AuditWriteFailed $e) {
+            $trace = collect($e->getTrace());
+        }
+
+        expect($trace->first()['class'].'::'.$trace->first()['function'])->toBe('Jiannius\Audit\Recorder::record')
+            ->and($trace->flatMap(fn ($frame) => $frame['args'] ?? [])->contains(fn ($arg) => $arg instanceof QueryException))->toBeFalse();
     });
 });
 
