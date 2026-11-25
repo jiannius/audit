@@ -26,7 +26,7 @@ class RawFormatter implements FormatsAuditValues
             return $raw;
         }
 
-        // A JSON column or a pivot field: the list [1, 1, 2] or the map {"1": {"role": "admin"}}.
+        // A pivot field: the list [1, 1, 2] or the map {"1": {"role": "admin"}}.
         $json = json_encode($raw, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
 
         return $json === false ? null : $json;
