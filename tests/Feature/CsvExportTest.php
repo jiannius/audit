@@ -231,6 +231,26 @@ describe('a query with its own order', function () {
             ->and(count(array_unique($ids)))->toBe(2200);
     });
 
+    it('refuses a limit or an offset, which paging by id could not honour', function (Closure $query) {
+        insertedAudit();
+
+        expect(fn () => csvText(CsvExport::make($query(Audit::query()))))->toThrow(InvalidArgumentException::class, 'Filter by a date or id range')
+            ->and(fn () => CsvExport::make($query(Audit::query()))->download('x.csv'))->toThrow(InvalidArgumentException::class);
+    })->with([
+        'latest and limit' => [fn ($query) => $query->latest()->limit(100)],
+        'take' => [fn ($query) => $query->take(5)],
+        'an offset' => [fn ($query) => $query->offset(3)],
+        'a skip' => [fn ($query) => $query->skip(1)->take(2)],
+    ]);
+
+    it('refuses a limit on a relation too', function () {
+        $document = new Document;
+        $document->setRawAttributes(['id' => 7]);
+        $document->exists = true;
+
+        expect(fn () => csvText(CsvExport::make($document->audits()->limit(10))))->toThrow(InvalidArgumentException::class);
+    });
+
     it('leaves the query it was given alone', function () {
         manyAudits(5);
 

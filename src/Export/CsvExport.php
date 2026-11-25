@@ -129,6 +129,7 @@ final class CsvExport
     public function download(string $filename, array $headers = []): StreamedResponse
     {
         $this->headingRow();
+        $this->assertNotLimited();
 
         $response = new StreamedResponse(function () {
             $handle = fopen('php://output', 'w');
@@ -162,6 +163,7 @@ final class CsvExport
     public function write($handle): int
     {
         $headings = $this->headingRow();
+        $this->assertNotLimited();
         $formatter = $this->formatter ?? app(FormatsAuditValues::class);
         $timezone = $this->timezone;
         $count = 0;
@@ -184,6 +186,19 @@ final class CsvExport
         }
 
         return $count;
+    }
+
+    /**
+     * Paging by id cannot honour a limit or an offset: `latest()->limit(100)` would export the hundred lowest
+     * ids, not the hundred newest. Refuse, instead of writing the wrong rows.
+     */
+    private function assertNotLimited(): void
+    {
+        $query = $this->query instanceof Relation ? $this->query->getQuery()->getQuery() : $this->query->getQuery();
+
+        if ($query->limit !== null || $query->offset !== null) {
+            throw new InvalidArgumentException('CsvExport reads every row of the query in id order, so it cannot honour limit() or offset(): it would export the lowest ids, not the ones you meant. Filter by a date or id range instead.');
+        }
     }
 
     /** @return list<string> */
