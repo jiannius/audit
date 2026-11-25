@@ -9,7 +9,7 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 > | P1 | `v1.0.0-alpha.1` | Table, `Audit` model, `Recorder`, actor, source and request id, queue propagation, scope columns, `Auditor::record`, `actingAs` and `withSource` | built |
 > | P2 | `alpha.2` | The `Auditable` trait | built |
 > | P3 | `alpha.3` | `Auditor::update`, `delete`, `pivot`, `updateQuietlyWithAudit`, `$model->audit()` | built |
-> | P4 | `alpha.4` | Sign-in listeners | spec |
+> | P4 | `alpha.4` | Sign-in listeners | built |
 > | P5 | `v1.0.0` | Retention, purge, CSV export, test helpers | spec |
 
 - [1. What it does and doesn't](#1-what-it-does-and-doesnt)
@@ -101,7 +101,7 @@ The table is append-only and has no foreign keys:
 | `old_values`, `new_values`, `meta` | JSON. Raw database values |
 | `created_at` | `datetime`, no `updated_at` |
 
-**Database notes.** MySQL's `json` type does not keep key order, so `old_values` and `new_values` may read back with their keys sorted. Do not rely on key order. Ids are strings so one table holds ULID and bigint subjects, and the package always binds them as strings, because comparing a varchar column to an integer defeats the index on MySQL.
+**Database notes.** MySQL's `json` type does not keep key order, so `old_values`, `new_values` and `meta` may read back with their keys sorted. Do not rely on key order. Ids are strings so one table holds ULID and bigint subjects, and the package always binds them as strings, because comparing a varchar column to an integer defeats the index on MySQL.
 
 ---
 
@@ -424,24 +424,31 @@ Name events after the domain action (`sent`, `voided`, `approved`), not the mech
 
 ## 6. Sign-ins
 
-> **Spec: lands in P4.**
-
-Listeners are registered for the events in `audit.auth.events`. All rows are category `auth`.
+Listeners are registered for the events in `audit.auth.events`; an event that is not in the list is not listened for at all. All rows are category `auth`, and they are written by the `Recorder` directly, so the `Auditable` rules (attribute exclusion, `transactional_saves`) do not apply to them.
 
 | Laravel event | `event` | Subject | Actor | Meta | If the insert fails |
 |---|---|---|---|---|---|
-| `Login` | `login` | user | user | `guard`, `via_remember`, `remember` | the login is removed from the session and the recaller cookie is unqueued, then the error is rethrown |
-| `Failed` | `login_failed` | matched user or null | none | `guard`, `identifier_key`, `identifier` | throws (the sign-in fails) |
+| `Login` | `login` | user | user | `guard`, `via_remember`, `remember` | the login is undone, then the error is rethrown |
+| `Failed` | `login_failed` | the matched user, or none | none | `guard`, `identifier_key`, `identifier` | throws (the sign-in fails) |
 | `Lockout` | `lockout` | none | none | `identifier_key`, `identifier` | throws |
 | `Logout` | `logout` | user | user | `guard` | reported, never thrown |
-| `CurrentDeviceLogout` | `logout_current_device` | user | user | `guard` | reported |
-| `OtherDeviceLogout` | `logout_other_devices` | user | user | `guard` | reported |
+| `CurrentDeviceLogout` | `logout_current_device` | user | user | `guard` | reported, never thrown |
+| `OtherDeviceLogout` | `logout_other_devices` | user | user | `guard` | reported, never thrown |
 | `PasswordReset` | `password_reset` | user | user | none | throws |
 
-**Identifier keys.** `audit.auth.identifier` is an ordered list, default `['email', 'username']`.
+`Failed` and `Lockout` rows have no actor even when someone else is signed in: the person trying to sign in is not yet anyone. The user snapshot (`actor_name`, `actor_identifier`) is read from the loaded attributes like any other actor ([section 7](#7-actor-source-and-queues)).
 
-- `Failed` records the first listed key present in the credentials, and its value. Nothing else is ever read from the credentials, because they carry the plaintext password.
-- `Lockout` carries only the request, so the first listed key present in the request input is recorded. A form that keeps its identifier elsewhere, such as a Livewire form, must put it into the input before firing `Lockout`:
+**Meta.** `guard` is the guard's name. `remember` is the flag Laravel passes with the event: whether the sign-in asked to be remembered, and always `true` when Laravel signs someone in from a remember cookie. `via_remember` is whether the guard's user came from a remember cookie, taken from `SessionGuard::viaRemember()`; it is `false` for any other guard class. A password login with "remember me" ticked is therefore `remember: true, via_remember: false`, a cookie login is `true, true`, and a programmatic `Auth::login($user)` is not recorded as a password sign-in. `via_remember` is the guard's state for the whole request: a later programmatic login in the same request after a cookie login records `true`.
+
+**Identifier keys.** `audit.auth.identifier` is an ordered list, default `['email', 'username']`. A host that signs in by username lists nothing extra: the default already covers it. A host that signs in by something else sets its own list, for example `['phone']`.
+
+- `Failed` records the first listed key present in the credentials, and its value. Nothing else is ever read from the credentials, because they carry the plaintext password: the password, a one-time code or any other key never reaches a row.
+- `Lockout` carries only the request, so it records the first listed key present in the request input (`$request->input()`). If none is present, `identifier_key` and `identifier` are `null`.
+- A key counts as present when its value is a string or a number. The value is trimmed and cut to 255 characters, and otherwise stored as typed.
+- A key that looks like a secret is never read, even when you list it: `*password*`, `*passwd*`, `*secret*`, `*token*`, `otp`, `code`, `*_code`, `pin`, and anything that matches `audit.attributes.redact` or `audit.attributes.exclude`. A misconfigured `['password']` records null identifier fields.
+- **People type their password into the email or username box.** Whatever is in that field is stored as typed, so a failed login row can hold a password. The package cannot tell. Treat these rows as sensitive and use retention ([section 10](#10-retention-and-purge)) to keep `auth` rows only as long as you need them.
+
+A form that keeps its identifier somewhere other than the top-level request input, such as a Livewire form, must put it into the input before firing `Lockout`:
 
 ```php
 request()->merge(['email' => $this->email]);
@@ -449,13 +456,23 @@ request()->merge(['email' => $this->email]);
 event(new Lockout(request()));
 ```
 
-- The value is trimmed and truncated, and otherwise stored as typed.
+**A failed login throws.** Laravel fires `Failed` from inside `Auth::attempt()`, so if its row cannot be written, `attempt()` throws `AuditWriteFailed` and the sign-in does not go on. The same goes for `Lockout` and `PasswordReset`: a sign-in that cannot be audited does not happen.
 
-**Rules**
+- **Throttling.** A `Failed` listener that throws (a broken audit table, an unmapped user class) runs before your own `RateLimiter::hit()`, so failed attempts are not counted while it throws.
+- **Map your user model.** With an unmapped user class, a matched user gets a 500 while an unknown one gets a 401, which tells an attacker which accounts exist.
+- **`PasswordReset` throws after your code changed the password.** Laravel fires it once your callback has saved the new password and before the broker deletes the token. A broken audit table gives a 500 with the password already changed and the token still usable.
 
-- `via_remember` comes from the guard's `viaRemember()`, so a programmatic `Auth::login()` is not recorded as a password sign-in.
-- `Login` fires after the session is written, so if its row cannot be written the login is undone, not just reported.
-- Sign-out fails open: a broken audit never stops someone signing out.
+**A login is undone.** `Login` fires after Laravel has written the session, so a throwing listener alone would leave the user signed in. When the row cannot be written, the package takes the login back: the guard forgets the user and cannot find them again for the rest of the request, the login id is removed from the session, and the remember cookie that was queued for the response is unqueued. Then the original error is rethrown. The undo reaches the guard through the auth manager, by the name on the event, so it works for guards registered under `auth.guards`. A guard built ad hoc with `Auth::build()`, or a custom guard that is not a `SessionGuard`, is not undone (a guard with `forgetUser()` is only told to forget its user); the exception is still rethrown. It does not call `logout()`, so it fires no further events and rotates no token. Two things stay as they are: the remember token that Laravel already saved on the user row, which is useless without its cookie, and a remember cookie the browser sent in, which will try to sign the user in again on the next request and be undone the same way for as long as the audit table is unwritable.
+
+**Signing out fails open.** A broken audit must never stop someone signing out. `Logout`, `CurrentDeviceLogout` and `OtherDeviceLogout` catch the failure and pass it to Laravel's exception handler with `report()`, so the sign-out completes and your error tracker hears about it. What is reported can be a different exception, for example a morph-map violation for an unmapped user, not only `AuditWriteFailed`. `AuditWriteFailed` itself carries only the table and the database error codes, never a value.
+
+Laravel's `logoutOtherDevices()` re-saves the user's password. For an `Auditable` user that writes an `updated` row (with the password `[redacted]`) in the `record` category, then the `logout_other_devices` row.
+
+**A user class missing from the morph map.** Under `Relation::enforceMorphMap()` a user whose class has no alias cannot be snapshotted, and Laravel throws `ClassMorphViolationException` from the listener. It follows the failure rule of its event: a `Login` is undone and the exception is rethrown, `Failed` (for a matched user) and `PasswordReset` throw, and the three sign-out events report it and carry on. Give every user class an alias ([section 14](#14-production-checklist)).
+
+**What is not recorded.** Only `SessionGuard` logins fire `Login`. Stateless and non-session sign-ins write no sign-in row: `Auth::once()` and `onceUsingId()`, `Auth::setUser()`, `actingAs()`, and token or request guards such as Sanctum tokens and `Auth::viaRequest()`. A failed `Auth::once()` does fire `Failed`, so it is recorded as `login_failed`.
+
+**What the listeners never do.** They never call `Auth::user()`, so recording a sign-in cannot start a remember-cookie login, and they run no query beyond the insert and load no relation. They are safe under `Model::shouldBeStrict()` and partial selects. With `audit.enabled` off they write nothing and undo nothing.
 
 ---
 
@@ -767,6 +784,8 @@ It skips statements that go through `Auditor::`. It is **biased towards false po
 expect(Jiannius\Audit\Audit::forSubject($invoice)->pluck('event')->all())->toBe(['created', 'sent']);
 ```
 
+**Compare JSON by meaning, not by key order.** MySQL's `json` type reorders object keys ([section 2](#2-install)), so a test that compares a multi-key `meta`, `old_values` or `new_values` with `toBe()` or `assertSame()` passes on SQLite and fails on MySQL. Use `toEqual()`, `assertEquals()` or `assertEqualsCanonicalizing()` instead.
+
 Run your suite under `Model::shouldBeStrict()` with an enforced morph map: that is how the package's own tests run.
 
 ---
@@ -795,8 +814,8 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 | `actor.context_key` | `null` | Fallback: a Context key holding the actor's id |
 | `request_id.context_key` | `null` | Reuse a request id your app already puts in Context |
 | `scopes` | `[]` | Scope columns: `column => Resolver::class` or `column => ['resolver' => ..., 'read' => ...]` ([section 8](#8-multi-tenant)) |
-| `auth.events` | all seven sign-in events | Which sign-in events are recorded (P4) |
-| `auth.identifier` | `['email', 'username']` | The first key present is recorded; nothing else is read (P4) |
+| `auth.events` | all seven sign-in events | Which sign-in events are recorded: `login`, `login_failed`, `lockout`, `logout`, `logout_current_device`, `logout_other_devices`, `password_reset`. Others are not listened for. A name that is not one of these is ignored |
+| `auth.identifier` | `['email', 'username']` | The first key present in the credentials (or, for a lockout, the request input) is recorded; nothing else is read ([section 6](#6-sign-ins)) |
 | `retention.record`, `.action`, `.auth` | `null` | Keep period such as `'7 years'`; `null` keeps forever (P5) |
 | `retention.overrides` | `[]` | First match wins; each has `keep` and at least one of `subject_type`, `event`, `category` (P5) |
 | `prune.schedule` | `'daily'` | A frequency method or cron expression; `null` disables the schedule (P5) |

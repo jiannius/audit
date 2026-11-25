@@ -547,7 +547,7 @@ describe('actor snapshot', function () {
         // Control: a route that does resolve the user logs in through the cookie, so the cookie is good.
         $this->withCookie($guard->getRecallerName(), $recaller)->get('/resolve')->assertOk();
         expect($logins)->toBe(1)
-            ->and($this->audits()->sole()->actor_id)->toBe((string) $user->id);
+            ->and($this->audits()->where('event', 'resolved')->sole()->actor_id)->toBe((string) $user->id);
 
         // The same cookie, no session id, on a route that never resolves the user: no lookup, no login.
         DB::table('audits')->delete();
