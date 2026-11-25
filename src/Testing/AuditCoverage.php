@@ -3,6 +3,7 @@
 namespace Jiannius\Audit\Testing;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use InvalidArgumentException;
 use Jiannius\Audit\Auditable;
@@ -32,6 +33,17 @@ final class AuditCoverage
 
     /** @var list<class-string<Model>>|null */
     private ?array $concrete = null;
+
+    /**
+     * Classes the autoloader already failed to find. Autoloading a file that declares another class runs it again
+     * each time, and a second run of such a file is a fatal error, so each class is asked for once per process.
+     *
+     * @var array<class-string, true>
+     */
+    private static array $missing = [];
+
+    /** @var array<string, string> file (relative to the path) => the class its path and the namespace say it declares */
+    private array $unresolved = [];
 
     private function __construct(private readonly string $path, private readonly string $namespace) {}
 
@@ -70,6 +82,10 @@ final class AuditCoverage
             if (! self::isAuditable($class) && ! isset($this->except[$class])) {
                 $problems[] = "  {$class} does not use Auditable. Add the trait, or list it in except() with the reason it is not audited.";
             }
+        }
+
+        foreach ($this->unresolved as $file => $class) {
+            $problems[] = "  {$file} does not declare {$class}, which its path and the namespace [{$this->namespace}] say it should, so it was not checked. Fix the namespace or the file name.";
         }
 
         foreach ($this->except as $class => $reason) {
@@ -154,18 +170,36 @@ final class AuditCoverage
             $relative = substr($file->getPathname(), strlen($this->path) + 1, -4);
             $class = $this->namespace.'\\'.str_replace(['/', '\\'], '\\', $relative);
 
-            if (! class_exists($class)) {
+            if (isset(self::$missing[$class]) || ! class_exists($class)) {
+                self::$missing[$class] = true;
+
+                // A trait, an interface or an enum is not a model. Anything else is a file nobody can check.
+                if (! interface_exists($class, false) && ! trait_exists($class, false) && ! enum_exists($class, false)) {
+                    $this->unresolved[ltrim(substr($file->getPathname(), strlen($this->path)), '/\\')] = $class;
+                }
+
                 continue;
             }
 
             $reflection = new ReflectionClass($class);
 
-            if ($reflection->isSubclassOf(Model::class) && $reflection->isInstantiable()) {
+            // A custom pivot model is audited through Auditor::pivot() on the relation's parent, not by the trait.
+            if ($reflection->isSubclassOf(Model::class) && $reflection->isInstantiable() && ! $reflection->isSubclassOf(Pivot::class)) {
                 $found[] = $class;
             }
         }
 
         sort($found);
+        ksort($this->unresolved);
+
+        if ($found === []) {
+            throw new InvalidArgumentException(sprintf(
+                'AuditCoverage found no Eloquent model under [%s] for the namespace [%s], so it would pass without checking anything. Check the path and the namespace (classes are found by PSR-4: the path below the directory is the class name).%s',
+                $this->path,
+                $this->namespace,
+                $this->unresolved === [] ? '' : ' These files did not declare the class their path implies: '.implode(', ', array_keys($this->unresolved)).'.',
+            ));
+        }
 
         return $this->concrete = $found;
     }

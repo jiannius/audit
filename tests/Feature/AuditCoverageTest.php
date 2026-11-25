@@ -4,15 +4,13 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Jiannius\Audit\Testing\AuditCoverage;
 use Jiannius\Audit\Tests\Fixtures\Coverage\Bad;
 use Jiannius\Audit\Tests\Fixtures\Coverage\Good;
+use Jiannius\Audit\Tests\Fixtures\Coverage\Mixed\Kept;
 use Jiannius\Audit\Tests\Fixtures\User;
 use PHPUnit\Framework\AssertionFailedError;
 
-const COVERAGE_GOOD = __DIR__.'/../Fixtures/Coverage/Good';
-const COVERAGE_BAD = __DIR__.'/../Fixtures/Coverage/Bad';
-
 function coverage(string $set): AuditCoverage
 {
-    return AuditCoverage::models($set === 'good' ? COVERAGE_GOOD : COVERAGE_BAD, 'Jiannius\\Audit\\Tests\\Fixtures\\Coverage\\'.ucfirst($set));
+    return AuditCoverage::models(__DIR__.'/../Fixtures/Coverage/'.ucfirst($set), 'Jiannius\\Audit\\Tests\\Fixtures\\Coverage\\'.ucfirst($set));
 }
 
 /** The message a failing assertion gives. */
@@ -156,4 +154,46 @@ describe('assertTransactional', function () {
 
 it('refuses a directory that does not exist', function () {
     expect(fn () => AuditCoverage::models('/nowhere/at/all', 'App\\Models')->assertAllAuditable())->toThrow(InvalidArgumentException::class);
+});
+
+describe('a path or namespace that finds nothing', function () {
+    it('throws instead of passing with no models, in every assertion', function (string $assertion) {
+        $coverage = AuditCoverage::models(__DIR__.'/../Fixtures/Coverage/Good', 'App\\Models');
+
+        expect(fn () => $coverage->{$assertion}())->toThrow(InvalidArgumentException::class, 'found no Eloquent model');
+    })->with(['assertAllAuditable', 'assertMorphMapped', 'assertTransactional']);
+
+    it('names the files that did not declare the class their path implies', function () {
+        try {
+            AuditCoverage::models(__DIR__.'/../Fixtures/Coverage/Good', 'Wrong\\Namespace')->assertAllAuditable();
+            test()->fail('It should have thrown.');
+        } catch (InvalidArgumentException $e) {
+            expect($e->getMessage())->toContain('Invoice.php')->toContain('Aliased.php');
+        }
+    });
+});
+
+describe('a set with a file that does not resolve, and custom pivots', function () {
+    beforeEach(function () {
+        Relation::morphMap(['coverage-kept' => Kept::class], merge: true);
+    });
+
+    it('reports the file whose class the path and namespace do not give', function () {
+        $message = coverageFailure(fn () => coverage('mixed')->assertAllAuditable());
+
+        expect($message)->toContain('(1)')
+            ->toContain('Mismatched.php does not declare Jiannius\Audit\Tests\Fixtures\Coverage\Mixed\Mismatched');
+    });
+
+    it('does not ask a custom pivot, or a morph pivot, for the trait', function () {
+        $message = coverageFailure(fn () => coverage('mixed')->assertAllAuditable());
+
+        expect($message)->not->toContain('Membership')->not->toContain('Tagging');
+    });
+
+    it('checks the models that do resolve', function () {
+        coverage('mixed')->assertMorphMapped()->assertTransactional();
+
+        expect(true)->toBeTrue();
+    });
 });

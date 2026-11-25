@@ -872,7 +872,9 @@ return [
 - It is **biased towards false positives**: one allowlist line with a reason costs little. It cannot see dynamic calls such as `$query->{$method}()`, a write that a helper hides, or a query built in a variable and written on a later line (`$query->update([...])` is not recognised, as `$order->update([...])` on a model is fine).
 - `writes()` returns every flagged statement and `check()` returns the violations and the stale entries, if you want to report them your own way.
 
-**`AuditCoverage`** finds your models by path: `app/Models/Billing/Invoice.php` is `App\Models\Billing\Invoice` (PSR-4). Abstract classes, traits and classes that are not Eloquent models are skipped.
+**`AuditCoverage`** finds your models by path: `app/Models/Billing/Invoice.php` is `App\Models\Billing\Invoice` (PSR-4). Abstract classes, traits, classes that are not Eloquent models and custom `Pivot` and `MorphPivot` models (which are audited through `Auditor::pivot()` on the relation's parent, not by the trait) are skipped.
+
+- If no model is found under the path and namespace, every assertion throws instead of passing with nothing checked. A PHP file whose path and the namespace give a class it does not declare (PSR-4 violated, or a wrong namespace) cannot be checked, and `assertAllAuditable()` reports it.
 
 - `assertAllAuditable()` fails for every concrete model that does not use `Auditable` and is not in `except()`. An exception needs a reason, and an exception that names a model that is audited after all, or is not in the directory, fails as stale.
 - `assertMorphMapped()` fails for every audited model whose class is not a value of the morph map.
