@@ -2,15 +2,25 @@
 
 namespace Jiannius\Audit\Tests;
 
+use Illuminate\Auth\Events\CurrentDeviceLogout;
+use Illuminate\Auth\Events\Failed;
+use Illuminate\Auth\Events\Lockout;
+use Illuminate\Auth\Events\Login;
+use Illuminate\Auth\Events\Logout;
+use Illuminate\Auth\Events\OtherDeviceLogout;
+use Illuminate\Auth\Events\PasswordReset;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Schema;
 use Jiannius\Audit\Audit;
 use Jiannius\Audit\AuditServiceProvider;
@@ -132,6 +142,40 @@ abstract class TestCase extends Orchestra
 
             return 'ok';
         });
+
+        // A login form as a host would write it: the identifier is whichever of email or username it posts.
+        $router->middleware('web')->post('/login', function (Request $request) {
+            $signedIn = Auth::attempt($request->only(['email', 'username', 'password']), $request->boolean('remember'));
+
+            return $signedIn ? 'ok' : response('no', 401);
+        });
+
+        $router->middleware('web')->post('/throttled-login', function (Request $request) {
+            $key = 'login:'.$request->ip();
+
+            if (RateLimiter::tooManyAttempts($key, 2)) {
+                event(new Lockout($request));
+
+                return response('locked', 429);
+            }
+
+            if (! Auth::attempt($request->only(['email', 'username', 'password']))) {
+                RateLimiter::hit($key);
+
+                return response('no', 401);
+            }
+
+            return 'ok';
+        });
+
+        $router->middleware('web')->post('/logout', function () {
+            Auth::logout();
+
+            return 'ok';
+        });
+
+        // Resolves the user the way a real page does, which is when a remember cookie logs someone in.
+        $router->middleware('web')->get('/whoami', fn () => (string) auth()->id());
 
         $router->get('/dispatch', function () {
             Auditor::record('dispatching');
@@ -296,6 +340,17 @@ abstract class TestCase extends Orchestra
         Auth::forgetGuards();
         Context::flush();
         $this->app->forgetScopedInstances();
+    }
+
+    /** Register the sign-in listeners again for a different `audit.auth.events` list. */
+    protected function useSignInEvents(array $events): void
+    {
+        foreach ([Login::class, Failed::class, Lockout::class, Logout::class, CurrentDeviceLogout::class, OtherDeviceLogout::class, PasswordReset::class] as $event) {
+            Event::forget($event);
+        }
+
+        config(['audit.auth.events' => $events]);
+        $this->app->getProvider(AuditServiceProvider::class)->registerSignInListeners();
     }
 
     protected function audits(): Collection

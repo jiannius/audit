@@ -50,6 +50,7 @@ class AuditServiceProvider extends ServiceProvider
 
         $this->registerContextHooks();
         $this->registerSourceListeners();
+        $this->registerSignInListeners();
     }
 
     /** Carry the actor and request id into queued jobs through hidden Context. */
@@ -76,6 +77,21 @@ class AuditServiceProvider extends ServiceProvider
 
         Event::listen(JobProcessing::class, fn (JobProcessing $event) => $context()->enter('queue', 'queue:'.$event->job->resolveName(), spl_object_id($event->job)));
         Event::listen([JobProcessed::class, JobFailed::class, JobExceptionOccurred::class], fn ($event) => $context()->leave('queue', spl_object_id($event->job)));
+    }
+
+    /**
+     * Listen for the sign-in events named in `audit.auth.events`; the others are not registered.
+     * The listener is resolved from the container on each event, so Octane never shares one across requests.
+     */
+    public function registerSignInListeners(): void
+    {
+        foreach ((array) config('audit.auth.events', []) as $name) {
+            if (is_string($name) && isset(SignInRecorder::EVENTS[$name])) {
+                [$event, $method] = SignInRecorder::EVENTS[$name];
+
+                Event::listen($event, [SignInRecorder::class, $method]);
+            }
+        }
     }
 
     /**
