@@ -176,7 +176,18 @@ abstract class TestCase extends Orchestra
             $table->id();
             $table->string('invoice_id', 26);
             $table->string('description')->nullable();
+            $table->integer('quantity')->default(0);
             $table->timestamps();
+        });
+
+        Schema::create('team_user', function (Blueprint $table) {
+            $table->unsignedBigInteger('user_id');
+            $table->unsignedBigInteger('team_id');
+            $table->string('role')->nullable();
+            $table->string('token')->nullable();
+            $table->string('api_token')->nullable();
+            $table->timestamps();
+            $table->primary(['user_id', 'team_id']);
         });
 
         Schema::create('orders', function (Blueprint $table) {
