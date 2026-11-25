@@ -38,14 +38,24 @@ class AuditObserver
 
         $changes = $model->getChanges();
 
-        if (self::restoringModels()->offsetExists($model) && $this->changesDeletedAt($model, $changes)) {
-            // Record the restore here, inside the save's transaction, instead of after it.
-            // The flag is cleared only once the row is written, so a failure can still undo the restore.
-            if ($this->wants($model, 'restored')) {
-                $this->writeChanges($model, 'restored', $changes);
+        $restore = self::restoringModels()->offsetExists($model) ? self::restoringModels()->offsetGet($model) : null;
+
+        if ($restore !== null && ! $this->isRestoreSave($restore, $changes)) {
+            // A restore that another listener cancelled never completed, so its flag is stale.
+            self::restoringModels()->offsetUnset($model);
+            $restore = null;
+        }
+
+        if ($restore !== null) {
+            // Record the restore here, inside the save's transaction, instead of after it. The flag
+            // stays (marked recorded, so there is no second row) until `restored` or abandonRestore(),
+            // so a later failure in the same save can still put deleted_at back.
+            if (! $restore['recorded'] && $this->wants($model, 'restored')) {
+                $this->writeChanges($model, 'restored', $changes, $restore);
             }
 
-            self::restoringModels()->offsetUnset($model);
+            $restore['recorded'] = true;
+            self::restoringModels()->offsetSet($model, $restore);
 
             return;
         }
@@ -59,6 +69,8 @@ class AuditObserver
 
     public function deleted(Model $model): void
     {
+        self::restoringModels()->offsetUnset($model);
+
         $force = $this->isForceDeleting($model);
 
         // A force delete fires `deleted` too; it is recorded once, as force_deleted.
@@ -84,6 +96,9 @@ class AuditObserver
             'column' => $column,
             'had' => $column !== null && array_key_exists($column, $attributes),
             'value' => $column !== null ? ($attributes[$column] ?? null) : null,
+            // Never loaded from the database: built in memory, or just created.
+            'fresh' => $model->wasRecentlyCreated || ! $model->exists,
+            'recorded' => false,
         ]);
     }
 
@@ -127,7 +142,7 @@ class AuditObserver
     }
 
     /** @param  array<string, mixed>  $changes */
-    private function writeChanges(Model $model, string $event, array $changes): void
+    private function writeChanges(Model $model, string $event, array $changes, ?array $restore = null): void
     {
         $exclude = $this->rules->excludePatterns($model);
         $keys = array_values(array_filter(array_keys($changes), fn ($key) => ! Str::is($exclude, (string) $key)));
@@ -140,8 +155,15 @@ class AuditObserver
         $previous = $model->getPrevious();
         $attributes = $model->getAttributes();
 
-        // A restore always records the deleted_at change, even when it was not selected and so reads null before.
-        $always = $event === 'restored' && method_exists($model, 'getDeletedAtColumn') ? [$model->getDeletedAtColumn()] : [];
+        // A restore records the deleted_at change even when the column was not selected and so reads null before,
+        // unless the model was never loaded from the database (nothing was trashed). When the old value is
+        // unknown, the old key is left out rather than claiming "was not deleted".
+        $always = $unknownOld = [];
+
+        if ($restore !== null && $restore['column'] !== null && ($restore['had'] || ! $restore['fresh'])) {
+            $always = [$restore['column']];
+            $unknownOld = $restore['had'] ? [] : [$restore['column']];
+        }
 
         $old = $new = [];
 
@@ -154,7 +176,10 @@ class AuditObserver
                 continue;
             }
 
-            $old[$key] = $before;
+            if (! in_array($key, $unknownOld, true)) {
+                $old[$key] = $before;
+            }
+
             $new[$key] = $after;
         }
 
@@ -186,11 +211,17 @@ class AuditObserver
         return method_exists($model, 'isForceDeleting') && $model->isForceDeleting();
     }
 
-    /** @param  array<string, mixed>  $changes */
-    private function changesDeletedAt(Model $model, array $changes): bool
+    /**
+     * Whether this save is the restore: deleted_at is among the changes, and it is cleared.
+     *
+     * @param  array<string, mixed>  $restore
+     * @param  array<string, mixed>  $changes
+     */
+    private function isRestoreSave(array $restore, array $changes): bool
     {
-        return method_exists($model, 'getDeletedAtColumn')
-            && array_key_exists($model->getDeletedAtColumn(), $changes);
+        return $restore['column'] !== null
+            && array_key_exists($restore['column'], $changes)
+            && $changes[$restore['column']] === null;
     }
 
     private static function restoringModels(): WeakMap

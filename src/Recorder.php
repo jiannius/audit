@@ -109,7 +109,7 @@ class Recorder
             }
         }
 
-        return $fields === [] ? $audit->meta : [...$audit->meta, 'truncated' => array_keys($fields)];
+        return $fields === [] ? $audit->meta : [...$audit->meta, '_truncated' => array_keys($fields)];
     }
 
     private function exceedsCap(mixed $value, int $cap): bool

@@ -227,6 +227,14 @@ describe('restored', function () {
         expect($this->audits()->pluck('event')->all())->toBe(['created', 'deleted', 'restored', 'updated']);
     });
 
+    it('writes nothing for a restore of a record that is not trashed', function () {
+        $document = makeDocument();
+
+        $document->restore();
+
+        expect($this->audits())->toHaveCount(1);
+    });
+
     it('writes nothing for a restore of a loaded record that is not trashed', function () {
         $document = Document::query()->findOrFail(makeDocument()->id);
 

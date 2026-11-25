@@ -170,6 +170,10 @@ trait Auditable
                 $this->forceDeleting = false;
             }
 
+            // Object casts (AsArrayObject and friends) mutate in place; drop what they cached.
+            $this->classCastCache = [];
+            $this->attributeCastCache = [];
+
             AuditObserver::abandonRestore($this);
 
             throw $e;

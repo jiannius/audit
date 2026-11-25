@@ -5,6 +5,7 @@ namespace Jiannius\Audit;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
 use ReflectionProperty;
+use Throwable;
 
 /**
  * The one place that decides which attributes are never stored (excluded) and
@@ -97,11 +98,29 @@ class AttributeRules
     /** @return list<string> */
     private function declaredHidden(Model $model): array
     {
-        return self::$declaredHidden[$model::class] ??= (function () use ($model) {
-            $hidden = (new ReflectionProperty($model, 'hidden'))->getDefaultValue();
+        return self::$declaredHidden[$model::class] ??= $this->freshHidden($model);
+    }
 
-            return is_array($hidden) ? array_values($hidden) : [];
-        })();
+    /**
+     * What a pristine instance hides. A fresh instance, because #[Hidden] attributes and
+     * #[Initialize] trait initialisers merge into the instance in the constructor, so the
+     * property default alone misses them. If the model cannot be built without arguments,
+     * the property default is the best baseline.
+     *
+     * @return list<string>
+     */
+    private function freshHidden(Model $model): array
+    {
+        $default = (new ReflectionProperty($model, 'hidden'))->getDefaultValue();
+        $hidden = is_array($default) ? $default : [];
+
+        try {
+            $hidden = array_merge($hidden, (new ($model::class))->getHidden());
+        } catch (Throwable) {
+            // keep the property default
+        }
+
+        return array_values(array_unique($hidden));
     }
 
     /** encrypted, encrypted:array, hashed, AsEncryptedArrayObject and friends. */

@@ -2,6 +2,7 @@
 
 namespace Jiannius\Audit\Tests\Fixtures;
 
+use Illuminate\Database\Eloquent\Casts\AsArrayObject;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
@@ -22,6 +23,7 @@ abstract class BaseDocument extends Model
             'options' => 'array',
             'total' => 'integer',
             'notes' => 'encrypted',
+            'settings' => AsArrayObject::class,
         ];
     }
 }

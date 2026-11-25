@@ -91,6 +91,47 @@ describe('after a failed audit insert', function () {
             ->and($this->audits()->pluck('event')->all())->toBe(['deleted']);
     });
 
+    it('a failure after the restored row was written still leaves the model trashed', function () {
+        $document = makeDocument();
+        $document->delete();
+
+        Document::saved(fn () => throw new RuntimeException('search sync failed'));
+
+        expect(fn () => $document->restore())->toThrow(RuntimeException::class, 'search sync failed');
+
+        expect($document->trashed())->toBeTrue()
+            ->and($document->isDirty())->toBeFalse()
+            ->and(DB::table('documents')->value('deleted_at'))->not->toBeNull()
+            ->and($this->audits()->pluck('event')->all())->toBe(['created', 'deleted']);
+    });
+
+    it('a cancelled restore does not turn a later deleted_at change into a restore', function () {
+        $document = makeDocument();
+        $document->delete();
+
+        Document::restoring(fn () => false);
+        expect($document->restore())->toBeFalse();
+
+        $document->deleted_at = now()->addDay();
+        $document->save();
+
+        expect($this->audits()->pluck('event')->all())->toBe(['created', 'deleted', 'updated']);
+    });
+
+    it('an object cast changed in place is not left dirty', function () {
+        $document = Document::query()->findOrFail(makeDocument(['settings' => ['theme' => 'light']])->id);
+
+        Document::saving(function (Document $model) {
+            $model->settings['theme'] = 'dark';
+        });
+
+        breakAudits();
+        expect(fn () => $document->save())->toThrow(AuditWriteFailed::class);
+
+        expect($document->isDirty())->toBeFalse()
+            ->and($document->settings['theme'])->toBe('light');
+    });
+
     it('a failed restore leaves the model trashed', function () {
         $document = makeDocument();
         $document->delete();
@@ -127,13 +168,21 @@ describe('increment() and decrement()', function () {
         expect(DB::table('documents')->value('total'))->toBe(100);
     });
 
-    it('roll back incrementEach() too', function () {
+    it('roll back incrementEach() too, and restore the model', function () {
         $document = makeDocument(['total' => 10]);
         breakAudits();
 
         expect(fn () => $document->incrementEach(['total' => 5]))->toThrow(AuditWriteFailed::class);
 
-        expect(DB::table('documents')->value('total'))->toBe(10);
+        expect(DB::table('documents')->value('total'))->toBe(10)
+            ->and($document->total)->toBe(10)
+            ->and($document->isDirty())->toBeFalse()
+            ->and($document->getOriginal('total'))->toBe(10);
+
+        expect(fn () => $document->decrementEach(['total' => 5]))->toThrow(AuditWriteFailed::class);
+
+        expect($document->total)->toBe(10)
+            ->and($document->isDirty())->toBeFalse();
     });
 
     it('stand with the switch off', function () {

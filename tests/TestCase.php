@@ -16,9 +16,11 @@ use Jiannius\Audit\Audit;
 use Jiannius\Audit\AuditServiceProvider;
 use Jiannius\Audit\Facades\Auditor;
 use Jiannius\Audit\Tests\Fixtures\Attachment;
+use Jiannius\Audit\Tests\Fixtures\AttributeHiddenDocument;
 use Jiannius\Audit\Tests\Fixtures\AuditedInvoice;
 use Jiannius\Audit\Tests\Fixtures\AuditedLine;
 use Jiannius\Audit\Tests\Fixtures\AuditedUser;
+use Jiannius\Audit\Tests\Fixtures\ComputedHiddenDocument;
 use Jiannius\Audit\Tests\Fixtures\CurrentTeam;
 use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\HiddenPinDocument;
@@ -56,6 +58,8 @@ abstract class TestCase extends Orchestra
             'attachment' => Attachment::class,
             'document' => Document::class,
             'hidden-pin-document' => HiddenPinDocument::class,
+            'attribute-hidden-document' => AttributeHiddenDocument::class,
+            'computed-hidden-document' => ComputedHiddenDocument::class,
             'stamped' => StampedRecord::class,
             'logged-document' => LoggedDocument::class,
             'unwrapped-document' => UnwrappedDocument::class,
@@ -215,6 +219,7 @@ abstract class TestCase extends Orchestra
             $table->text('options')->nullable();
             $table->integer('total')->nullable();
             $table->text('notes')->nullable();
+            $table->text('settings')->nullable();
             $table->string('pin')->nullable();
             $table->string('api_token')->nullable();
             $table->string('webhook_secret')->nullable();

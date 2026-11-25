@@ -151,7 +151,7 @@ describe('value size', function () {
 
         $audit = $this->audits()->sole();
 
-        expect($audit->meta)->toBe(['big' => '[truncated 500 bytes]', 'truncated' => ['big', 'nested']])
+        expect($audit->meta)->toBe(['big' => '[truncated 500 bytes]', '_truncated' => ['big', 'nested']])
             ->and($audit->old_values)->toEqual(['big' => '[truncated 101 bytes]', 'fine' => str_repeat('o', 100)])
             ->and($audit->new_values)->toBe(['nested' => ['big' => '[truncated 400 bytes]']]);
     });

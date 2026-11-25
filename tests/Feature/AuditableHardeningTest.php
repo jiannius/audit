@@ -1,8 +1,11 @@
 <?php
 
 use Illuminate\Database\Eloquent\Model;
+use Jiannius\Audit\AttributeRules;
 use Jiannius\Audit\Auditable;
 use Jiannius\Audit\AuditObserver;
+use Jiannius\Audit\Tests\Fixtures\AttributeHiddenDocument;
+use Jiannius\Audit\Tests\Fixtures\ComputedHiddenDocument;
 use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\HiddenPinDocument;
 use Jiannius\Audit\Tests\Fixtures\StampedRecord;
@@ -28,6 +31,54 @@ describe('hidden attributes', function () {
             ->and($this->audits()->last()->old_values)->toMatchArray(['pin' => '[redacted]'])
             ->and(everythingAudited())->not->toContain('pin-one')
             ->and(everythingAudited())->not->toContain('pin-three');
+    });
+});
+
+describe('hidden attributes declared another way', function () {
+    it('stay redacted when #[Hidden] declares them and makeVisible() is called', function () {
+        $document = AttributeHiddenDocument::create(['title' => 'Safe', 'pin' => 'pin-one']);
+
+        $document->makeVisible('pin')->update(['pin' => 'pin-two']);
+
+        expect($this->audits()->first()->new_values)->toMatchArray(['pin' => '[redacted]'])
+            ->and($this->audits()->last()->old_values)->toBe(['pin' => '[redacted]'])
+            ->and($this->audits()->last()->new_values)->toBe(['pin' => '[redacted]'])
+            ->and(everythingAudited())->not->toContain('pin-one')
+            ->and(everythingAudited())->not->toContain('pin-two');
+    });
+
+    it('stay redacted when getHidden() is overridden', function () {
+        $document = ComputedHiddenDocument::create(['title' => 'Safe', 'pin' => 'pin-one']);
+
+        $document->setHidden([])->makeVisible('pin')->update(['pin' => 'pin-two']);
+
+        expect($this->audits()->last()->new_values)->toBe(['pin' => '[redacted]'])
+            ->and(everythingAudited())->not->toContain('pin-one')
+            ->and(everythingAudited())->not->toContain('pin-two');
+    });
+
+    it('fall back to the property default when a fresh instance cannot be built', function () {
+        $model = new class extends Document
+        {
+            public static bool $failToBuild = false;
+
+            protected $hidden = ['pin'];
+
+            public function __construct(array $attributes = [])
+            {
+                if (self::$failToBuild) {
+                    throw new RuntimeException('cannot be built here');
+                }
+
+                parent::__construct($attributes);
+            }
+        };
+
+        $model::$failToBuild = true;
+
+        $values = app(AttributeRules::class)->values($model->makeVisible('pin'), ['pin' => 'p', 'title' => 't']);
+
+        expect($values)->toBe(['pin' => '[redacted]', 'title' => 't']);
     });
 });
 
@@ -123,7 +174,7 @@ describe('database-shaped values', function () {
 });
 
 describe('restoring a partial select', function () {
-    it('records the restore even when deleted_at was not selected', function () {
+    it('records the restore even when deleted_at was not selected, without claiming what it was', function () {
         $document = Document::create(['title' => 'Memo']);
         $document->delete();
 
@@ -133,14 +184,14 @@ describe('restoring a partial select', function () {
         $audit = $this->audits()->last();
 
         expect($this->audits()->pluck('event')->all())->toBe(['created', 'deleted', 'restored'])
-            ->and($audit->old_values)->toBe(['deleted_at' => null])
+            ->and($audit->old_values)->toBeNull()
             ->and($audit->new_values)->toBe(['deleted_at' => null])
             ->and(Document::query()->count())->toBe(1);
     });
 });
 
 describe('truncated values', function () {
-    it('are listed in meta.truncated, so an identical-looking update is explained', function () {
+    it('are listed in meta._truncated, so an identical-looking update is explained', function () {
         config(['audit.max_value_bytes' => 100]);
 
         $document = makeDocument(['options' => ['body' => str_repeat('x', 300)]]);
@@ -149,10 +200,10 @@ describe('truncated values', function () {
         $created = $this->audits()->first();
         $updated = $this->audits()->last();
 
-        expect($created->meta)->toBe(['truncated' => ['options']])
+        expect($created->meta)->toBe(['_truncated' => ['options']])
             ->and($updated->old_values['options'])->toBe($updated->new_values['options'])
             ->and($updated->old_values['total'])->toBe(100)
-            ->and($updated->meta)->toBe(['truncated' => ['options']]);
+            ->and($updated->meta)->toBe(['_truncated' => ['options']]);
     });
 
     it('add nothing to meta when no value was truncated', function () {
