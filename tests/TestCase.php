@@ -15,13 +15,20 @@ use Illuminate\Support\Facades\Schema;
 use Jiannius\Audit\Audit;
 use Jiannius\Audit\AuditServiceProvider;
 use Jiannius\Audit\Facades\Auditor;
+use Jiannius\Audit\Tests\Fixtures\Attachment;
+use Jiannius\Audit\Tests\Fixtures\AuditedInvoice;
+use Jiannius\Audit\Tests\Fixtures\AuditedLine;
+use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\CurrentTeam;
+use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\Invoice;
 use Jiannius\Audit\Tests\Fixtures\InvoiceLine;
+use Jiannius\Audit\Tests\Fixtures\LoggedDocument;
 use Jiannius\Audit\Tests\Fixtures\Order;
 use Jiannius\Audit\Tests\Fixtures\RecordActorJob;
 use Jiannius\Audit\Tests\Fixtures\RecordCommand;
 use Jiannius\Audit\Tests\Fixtures\Team;
+use Jiannius\Audit\Tests\Fixtures\UnwrappedDocument;
 use Jiannius\Audit\Tests\Fixtures\User;
 use Orchestra\Testbench\TestCase as Orchestra;
 
@@ -41,6 +48,13 @@ abstract class TestCase extends Orchestra
             'invoice' => Invoice::class,
             'invoice-line' => InvoiceLine::class,
             'order' => Order::class,
+            'audited-invoice' => AuditedInvoice::class,
+            'audited-line' => AuditedLine::class,
+            'audited-user' => AuditedUser::class,
+            'attachment' => Attachment::class,
+            'document' => Document::class,
+            'logged-document' => LoggedDocument::class,
+            'unwrapped-document' => UnwrappedDocument::class,
         ]);
 
         CurrentTeam::$id = null;
@@ -149,6 +163,8 @@ abstract class TestCase extends Orchestra
             $table->softDeletes();
         });
 
+        $this->createDocumentsTable();
+
         Schema::create('jobs', function (Blueprint $table) {
             $table->id();
             $table->string('queue')->index();
@@ -160,6 +176,25 @@ abstract class TestCase extends Orchestra
         });
 
         $this->createAuditsTable();
+    }
+
+    protected function createDocumentsTable(?string $connection = null): void
+    {
+        Schema::connection($connection)->create('documents', function (Blueprint $table) {
+            $table->id();
+            $table->string('title')->nullable();
+            $table->string('status')->nullable();
+            $table->dateTime('placed_at')->nullable();
+            $table->text('options')->nullable();
+            $table->integer('total')->nullable();
+            $table->text('notes')->nullable();
+            $table->string('pin')->nullable();
+            $table->string('api_token')->nullable();
+            $table->string('webhook_secret')->nullable();
+            $table->string('internal_ref')->nullable();
+            $table->timestamps();
+            $table->softDeletes();
+        });
     }
 
     /** Run the package's own migration stub, then add the scope columns a host would add. */

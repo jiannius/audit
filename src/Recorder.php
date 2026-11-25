@@ -65,7 +65,7 @@ class Recorder
             ->insert($row);
     }
 
-    /** The label snapshot: the model's own auditLabel() when it has one, else the first filled configured attribute. */
+    /** The label snapshot: the model's own auditLabel() when it has one, else the default. */
     public function labelFor(Model $model): ?string
     {
         if (method_exists($model, 'auditLabel')) {
@@ -74,6 +74,12 @@ class Recorder
             return is_scalar($label) || $label instanceof Stringable ? (string) $label : null;
         }
 
+        return $this->defaultLabel($model);
+    }
+
+    /** The first filled attribute listed in config('audit.attributes.label'), read strict-safely from the raw attributes. */
+    public function defaultLabel(Model $model): ?string
+    {
         $attributes = $model->getAttributes();
 
         foreach ((array) config('audit.attributes.label', []) as $key) {
