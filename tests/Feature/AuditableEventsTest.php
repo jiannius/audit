@@ -83,6 +83,21 @@ describe('updated', function () {
             ]);
     });
 
+    it('records increment() and decrement()', function () {
+        $document = makeDocument();
+
+        $document->increment('total', 5);
+        $document->decrement('total', 2);
+
+        $audits = $this->audits();
+
+        expect($audits->pluck('event')->all())->toBe(['created', 'updated', 'updated'])
+            ->and($audits[1]->old_values)->toBe(['total' => 100])
+            ->and($audits[1]->new_values)->toBe(['total' => 105])
+            ->and($audits[2]->old_values)->toBe(['total' => 105])
+            ->and($audits[2]->new_values)->toBe(['total' => 103]);
+    });
+
     it('records a change to null', function () {
         $document = makeDocument();
 

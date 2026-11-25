@@ -103,8 +103,6 @@ The table is append-only and has no foreign keys:
 
 ## 3. Auditing a model
 
-> **Spec: lands in P2.**
-
 ```php
 use Jiannius\Audit\Auditable;
 
@@ -114,50 +112,80 @@ class Invoice extends Model
 }
 ```
 
+Every model that uses `Auditable` needs a morph-map alias ([section 2](#2-install)). The trait calls `getMorphClass()` and lets it throw, so a missing alias fails the first save, and the save is rolled back.
+
 **What each event stores**
 
-| Event | `old_values` | `new_values` |
-|---|---|---|
-| `created` | none | the raw attributes inserted |
-| `updated` | the changed keys only | the changed keys only |
-| `deleted` | the full raw snapshot, with `meta.soft` true or false | none |
-| `force_deleted` | the full raw snapshot | none |
-| `restored` | the `deleted_at` before | the `deleted_at` after |
+| Event | `old_values` | `new_values` | `meta` |
+|---|---|---|---|
+| `created` | none | the raw attributes inserted | none |
+| `updated` | the changed keys only | the changed keys only | none |
+| `deleted` | the full raw snapshot | none | `soft`: `true` for a soft delete, `false` for a hard delete |
+| `force_deleted` | the full raw snapshot | none | none |
+| `restored` | the changed keys (`deleted_at` before) | the changed keys (`deleted_at` after) | none |
 
-- Values are **raw database values**: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers.
-- A save with no changes left after excludes writes no row: touch-only saves, remember-token cycling and excluded-only changes are skipped.
-- `restore()` writes one `restored` row, not an extra `updated` one.
+- Values are **raw database values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers.
+- `created` stores the attributes the model held when it was inserted. A column the database fills in by default is not in it.
+- `restore()` writes **one** `restored` row, not an extra `updated` one, and writes it inside the save, so it is as atomic as any other change.
+- `forceDelete()` writes one `force_deleted` row. It is recorded when `auditEvents()` lists `deleted` or `force_deleted`.
+- `saveQuietly()`, `updateQuietly()` and `withoutEvents()` fire no model events, so they write no row. Use the helpers in [section 4](#4-writes-that-skip-events).
+- `increment()` and `decrement()` fire `updated`, so they are recorded.
+- A save with no changes left after excludes writes **no row**: touch-only saves, remember-token cycling and excluded-only changes are skipped. A change from `null` to `null` (an attribute that was never loaded, now set to `null`) is not a change either.
+- Every row has the category `record`.
 
-**Overridable methods** (defaults in comments)
+**Overridable methods.** Each has a default, so you only write the ones you need:
 
 ```php
-public function auditLabel(): ?string;            // first filled config('audit.attributes.label') key
-public function auditParent(): Model|array|null;  // null; e.g. [Invoice::class, $this->getAttributes()['invoice_id'] ?? null]
-public function auditExclude(): array;            // [] never stored, never counts as a change (glob patterns)
-public function auditRedact(): array;             // [] stored as "[redacted]"
+public function auditLabel(): ?string;            // the first filled key of config('audit.attributes.label')
+public function auditParent(): Model|array|null;  // null; or [Invoice::class, $id], or a model
+public function auditExclude(): array;            // []: never stored, never counts as a change (glob patterns)
+public function auditRedact(): array;             // []: stored as "[redacted]" (glob patterns)
 public function auditEvents(): array;             // ['created', 'updated', 'deleted', 'restored']
 ```
 
-`auditEvents()` narrows a noisy model, for example `['deleted']` for attachments.
+- **Label.** `subject_label` is a snapshot, so a row stays readable after the record is gone. It is read from the raw attributes.
+- **Parent.** A child can roll up to its parent, so a timeline shows both:
+
+  ```php
+  class InvoiceLine extends Model
+  {
+      use Auditable;
+
+      public function auditParent(): array
+      {
+          return [Invoice::class, $this->getAttributes()['invoice_id'] ?? null];
+      }
+  }
+  ```
+
+  The class must have a morph alias. With no id (`null` or empty) the row has no parent. You can also return a model you already hold.
+- **Exclude and redact** are added to the lists in config (`attributes.exclude`, `attributes.redact`). Both take glob patterns: `'internal_*'`, `'*_token'`.
+- **`auditEvents()`** narrows a noisy model, for example `['deleted']` for attachments. `deleted` also covers `force_deleted`.
+- **Scope columns** are filled by your resolvers ([section 8](#8-multi-tenant)). They receive the `PendingAudit`, whose `subject` is the model, so a resolver can read it. Read it with `getAttributes()`, like your overrides.
 
 **Secrets, on by default**
 
 - `password` is stored as `"[redacted]"`.
-- `remember_token`, `*_token`, `*_secret` and `two_factor_recovery_codes` are excluded entirely.
-- Attributes in the model's `$hidden` and attributes cast `encrypted*`, `hashed` or `AsEncrypted*` are redacted automatically.
+- `remember_token`, `*_token`, `*_secret` and `two_factor_recovery_codes` are excluded entirely: not stored, and a save that changes only those writes no row.
+- Attributes in the model's `$hidden` (`attributes.redact_hidden`) and attributes cast `encrypted`, `encrypted:*`, `hashed` or `AsEncrypted*` (`attributes.redact_encrypted`) are redacted automatically.
+- A redacted attribute that is `null` stays `null`, so a row still shows that a value was set or cleared, never what it was.
+- Excluding wins over redacting.
 
-**Strict mode.** The trait never reads a relation or a magic attribute. Your overrides must not either: read from `$this->getAttributes()` with `array_key_exists`. A model loaded with a partial `select()` then works under `shouldBeStrict()`.
+**Reading the trail**
 
 ```php
-public function auditParent(): array
-{
-    return [Invoice::class, $this->getAttributes()['invoice_id'] ?? null];
-}
+$invoice->audits;          // MorphMany: the rows where the invoice is the subject
+$invoice->auditTrail();    // Builder: the invoice's rows plus the rows whose parent is the invoice
+$invoice->auditTrail()->latest('id')->paginate();
 ```
 
-**Saves are transactional.** With `audit.transactional_saves` on (the default), `save()` and `delete()` run inside `$this->getConnection()->transaction(...)`, so the change and its row commit or roll back together ([section 9](#9-failure-behaviour)).
+`auditTrail()` is unordered, so add your own order. Both go through the `Audit` model, so a [read scope](#8-multi-tenant) applies. `audits()` always binds the id as a string, as the package's own scopes do.
 
-**Models that override `save()`.** A method on the class beats the trait's, so the wrapper is silently skipped. Alias it instead:
+**Strict mode.** The trait never reads a relation or a magic attribute. Your overrides must not either: read from `$this->getAttributes()` with `array_key_exists` or `??`, as in the `auditParent()` above. A model loaded with a partial `select()` then works under `shouldBeStrict()`. Do not write `$this->name`, `$this->invoice->number` or any other accessor in an override: under strict mode they throw when the attribute was not selected or the relation was not loaded.
+
+**Saves are transactional.** With `audit.transactional_saves` on (the default), `save()` and `delete()` run inside `$this->getConnection()->transaction(...)`, so the change and its row commit or roll back together ([section 9](#9-failure-behaviour)). `restore()` and `forceDelete()` go through `save()` and `delete()`, so they are covered too. The transaction is the model's own connection, which is the connection the row is written on while `audit.connection` is `null`. If you set `audit.connection` to another connection, the row cannot join the change's transaction. Nothing is wrapped while `audit.enabled` is `false`.
+
+**Models that override `save()`.** A method on the class beats the trait's, so the wrapper is silently skipped. Alias it instead, and call the alias where you would have called `parent::save()`:
 
 ```php
 use Auditable { save as auditableSave; }
@@ -169,7 +197,9 @@ public function save(array $options = [])
 }
 ```
 
-`increment()` and `decrement()` do not call `save()`; they are atomic only inside your own transaction.
+The same goes for an overridden `delete()`: alias it as `auditableDelete`. The `AuditCoverage::assertTransactional()` test helper flags models that override either without the alias ([section 12](#12-testing-your-app)).
+
+`increment()` and `decrement()` do not call `save()`, so they are atomic only inside your own transaction.
 
 ---
 
