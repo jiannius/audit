@@ -34,7 +34,7 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 
 **It does**
 
-- Record who changed what and when, with the old and new raw database values, for any model that uses the `Auditable` trait.
+- Record who changed what and when, with the old and new raw values, for any model that uses the `Auditable` trait.
 - Record sign-ins, failed sign-ins, lockouts, sign-outs and password resets.
 - Record custom events, such as `sent` or `voided`, and give you helpers for writes that skip model events: bulk updates and deletes, quiet updates, `DB::table` writes and pivot changes.
 - Snapshot the actor (who), the record label and any host scope columns (for example a tenant) on every row, so a row stays readable after the user or the record is gone.
@@ -130,7 +130,7 @@ Every model that uses `Auditable` needs a morph-map alias ([section 2](#2-instal
 
 Any row whose old or new value was replaced by the truncation marker also has `meta._truncated`, the list of those fields ([section 9](#9-failure-behaviour)). The leading underscore keeps it clear of your own meta keys; the package owns `_truncated`.
 
-- Values are **raw values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers, and PHP booleans are stored as `1` and `0`, as the database holds them. `old_values` come from the database. `new_values` are what the model holds after the save, as it was assigned, so a few casts differ in shape from what you would read back: a `decimal` column assigned a float stays a float (and one read from the database is a string), and an integer column assigned `'5'` stays `'5'`. Compare values by meaning, not by type.
+- Values are **raw values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers, and PHP booleans are stored as `1` and `0`, as the database holds them. `old_values` are what the model instance held as loaded (its original attributes, `getPrevious()` after the save), not a fresh read of the database: see "Limits" below. `new_values` are what the model holds after the save, as it was assigned, so a few casts differ in shape from what you would read back: a `decimal` column assigned a float stays a float (and one read from the database is a string), and an integer column assigned `'5'` stays `'5'`. Compare values by meaning, not by type.
 - A string value over `audit.max_value_bytes` is stored as the marker `"[truncated N bytes]"`, so a large attribute never blocks a save ([section 9](#9-failure-behaviour)).
 - `created` stores the attributes the model held when it was inserted. A column the database fills in by default is not in it.
 - `restore()` writes **one** `restored` row, not an extra `updated` one, and writes it inside the save, so it is as atomic as any other change. A model that was never trashed (built or created in memory, then restored) writes none. When the model was loaded without `deleted_at`, the row has no `old_values`, because what it was is unknown.
@@ -139,6 +139,8 @@ Any row whose old or new value was replaced by the truncation marker also has `m
 - `increment()`, `decrement()` and `incrementEach()` fire `updated`, so they are recorded.
 - A save with no changes left after excludes writes **no row**: touch-only saves, remember-token cycling and excluded-only changes are skipped. A change from `null` to `null` (an attribute that was never loaded, now set to `null`) is not a change either.
 - Every row has the category `record`.
+
+**Limits: old values are the instance's, not the database's.** For a model save, `old_values` come from the model instance in memory. If the record was changed through another copy of the model or a raw query after this instance was loaded, the instance is stale and the row records a stale old value (the new value is still what was written). When accuracy against concurrent writers matters, re-fetch with `fresh()` or `refresh()` just before saving. The bulk helpers in [section 4](#4-writes-that-skip-events) do not have this limit: they read old values from the database under a lock.
 
 **Overridable methods.** Each has a default, so you only write the ones you need:
 
@@ -275,6 +277,7 @@ Over two invoices, the last call writes these rows:
 
 **How it works.** In one transaction on the query's connection it selects the matching rows (`select *`, with `lockForUpdate`), runs your update, reads the same rows again by key, and compares the columns you wrote. So:
 
+- **Old values are read from the database inside the transaction,** under the lock, so they are exact even if another writer changed the rows since you loaded them. This differs from a model save ([section 3](#3-auditing-a-model)), whose old values are the instance's in-memory originals. `Auditor::delete()` and `Auditor::pivot()` read their snapshots the same way.
 - **Expressions work** (`DB::raw`, arithmetic on a column): the new value is read back, not computed.
 - **Only changed records get a row.** A record the update left as it was, such as `status` set to what it already was, gets none. A call that changes nothing writes nothing.
 - **Only the columns you wrote** are in `old_values` and `new_values`. A JSON path (`'settings->theme'`) is recorded as the whole `settings` column, and a table-qualified name (`'invoices.total'`) as `total`.
@@ -332,7 +335,7 @@ $invoice->updateQuietlyWithAudit(['external_id' => $externalId], event: 'synced'
 // returns bool, like updateQuietly()
 ```
 
-It fills the model, saves it without events, and records one row from `getPrevious()` and `getChanges()`, in one transaction (whatever `transactional_saves` says: no `saved` hook is involved). The row has the same old and new values as an `updated` row from the observer, with your `event` (default `updated`) and `meta`, category `record`. A call that changes nothing, or only excluded attributes, writes no row. If the insert fails the update rolls back and the model is left as a failed `save()` leaves it: your values assigned and dirty, the originals untouched, so a retry of `save()` works.
+It fills the model, saves it without events, and records one row from `getPrevious()` and `getChanges()`, in one transaction (whatever `transactional_saves` says: no `saved` hook is involved). The row has the same old and new values as an `updated` row from the observer, with your `event` (default `updated`) and `meta`, category `record`. Like a model save, its old values are the instance's in-memory originals, so `refresh()` first if the record may have changed elsewhere ([section 3](#3-auditing-a-model), "Limits"). A call that changes nothing, or only excluded attributes, writes no row. If the insert fails the update rolls back and the model is left as a failed `save()` leaves it: your values assigned and dirty, the originals untouched, so a retry of `save()` works.
 
 ### Pivot changes
 
