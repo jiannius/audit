@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Schema;
 use Jiannius\Audit\Audit;
 use Jiannius\Audit\Exceptions\AuditWriteFailed;
+use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\UnmappedUser;
 use Jiannius\Audit\Tests\Fixtures\User;
 
@@ -376,6 +377,21 @@ describe('sign-out', function () {
         expect($audit->subject_id)->toBe((string) $user->id)
             ->and($audit->actor_id)->toBe((string) $user->id)
             ->and($audit->meta)->toEqual(['guard' => 'web']);
+    });
+
+    it('writes an updated row, with the password redacted, before logout_other_devices for an auditable user', function () {
+        $user = AuditedUser::create(['name' => 'Ada Lovelace', 'email' => 'ada@example.test', 'password' => 'secret-password']);
+        Auth::setUser($user);
+        $before = $this->audits()->count();
+
+        Auth::logoutOtherDevices('secret-password');
+
+        $rows = $this->audits()->slice($before)->values();
+
+        expect($rows->pluck('event')->all())->toBe(['updated', 'logout_other_devices'])
+            ->and($rows[0]->category)->toBe('record')
+            ->and($rows[0]->new_values)->toEqual(['password' => '[redacted]'])
+            ->and(everythingAudited())->not->toContain('secret-password');
     });
 
     it('records a logout from a user loaded with a partial select, under strict mode', function () {
