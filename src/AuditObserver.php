@@ -40,11 +40,12 @@ class AuditObserver
 
         if (self::restoringModels()->offsetExists($model) && $this->changesDeletedAt($model, $changes)) {
             // Record the restore here, inside the save's transaction, instead of after it.
-            self::restoringModels()->offsetUnset($model);
-
+            // The flag is cleared only once the row is written, so a failure can still undo the restore.
             if ($this->wants($model, 'restored')) {
                 $this->writeChanges($model, 'restored', $changes);
             }
+
+            self::restoringModels()->offsetUnset($model);
 
             return;
         }
@@ -75,7 +76,43 @@ class AuditObserver
 
     public function restoring(Model $model): void
     {
-        self::restoringModels()->offsetSet($model, true);
+        $column = method_exists($model, 'getDeletedAtColumn') ? $model->getDeletedAtColumn() : null;
+        $attributes = $model->getAttributes();
+
+        // Remember deleted_at as it is now: restore() clears it before saving.
+        self::restoringModels()->offsetSet($model, [
+            'column' => $column,
+            'had' => $column !== null && array_key_exists($column, $attributes),
+            'value' => $column !== null ? ($attributes[$column] ?? null) : null,
+        ]);
+    }
+
+    /**
+     * A restore whose save failed: put deleted_at back, so the model is still trashed.
+     * Does nothing when no restore is in progress.
+     */
+    public static function abandonRestore(Model $model): void
+    {
+        if (! self::restoringModels()->offsetExists($model)) {
+            return;
+        }
+
+        $state = self::restoringModels()->offsetGet($model);
+        self::restoringModels()->offsetUnset($model);
+
+        if (! is_array($state) || $state['column'] === null) {
+            return;
+        }
+
+        $attributes = $model->getAttributes();
+
+        if ($state['had']) {
+            $attributes[$state['column']] = $state['value'];
+        } else {
+            unset($attributes[$state['column']]);
+        }
+
+        $model->setRawAttributes($attributes);
     }
 
     public function restored(Model $model): void
