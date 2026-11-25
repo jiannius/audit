@@ -16,6 +16,12 @@ class AuditObserver
 {
     public const REDACTED = AttributeRules::REDACTED;
 
+    /** What `auditEvents()` returns by default, and what a model without the Auditable trait is treated as recording. */
+    public const DEFAULT_EVENTS = ['created', 'updated', 'deleted', 'restored'];
+
+    /** The events a model's `auditEvents()` can switch off. Any other event name is a custom one and is always recorded. */
+    private const STANDARD_EVENTS = ['created', 'updated', 'deleted', 'force_deleted', 'restored'];
+
     /** Models between restoring and restored, so the save in between records one row, not two. */
     private static ?WeakMap $restoring = null;
 
@@ -135,14 +141,66 @@ class AuditObserver
         self::restoringModels()->offsetUnset($model);
     }
 
+    /**
+     * Record the model's last save as one row, from getPrevious() and getChanges(): what
+     * updateQuietlyWithAudit() calls. Writes nothing when no change is left after the excludes.
+     *
+     * @param  array<string, mixed>  $meta
+     */
+    public function recordChanges(Model $model, string $event, array $meta = []): void
+    {
+        $this->writeChanges($model, $event, $model->getChanges(), null, $meta);
+    }
+
+    /**
+     * Record a custom event for the model, category `action`. Old and new values follow the
+     * model's exclude and redact rules, so a secret passed in is never stored.
+     *
+     * @param  array<string, mixed>  $meta
+     * @param  array<string, mixed>  $old
+     * @param  array<string, mixed>  $new
+     */
+    public function recordAction(Model $model, string $event, array $meta = [], array $old = [], array $new = []): void
+    {
+        $this->recorder->record(new PendingAudit(
+            $event,
+            Category::ACTION,
+            $model,
+            $this->parentOf($model),
+            $meta,
+            $this->values($model, $old),
+            $this->values($model, $new),
+        ));
+    }
+
+    /**
+     * Whether a helper should record this event for the model. A custom event name is always
+     * recorded; a standard one follows the model's `auditEvents()` (`deleted` covers `force_deleted`).
+     */
+    public function allows(Model $model, string $event): bool
+    {
+        if (! config('audit.enabled', true)) {
+            return false;
+        }
+
+        if (! in_array($event, self::STANDARD_EVENTS, true)) {
+            return true;
+        }
+
+        return $this->wants($model, $event, $event === 'force_deleted' ? 'deleted' : null);
+    }
+
     /** Apply the exclude and redact rules to a set of raw attributes. */
     public function values(Model $model, array $attributes): array
     {
         return $this->rules->values($model, $attributes);
     }
 
-    /** @param  array<string, mixed>  $changes */
-    private function writeChanges(Model $model, string $event, array $changes, ?array $restore = null): void
+    /**
+     * @param  array<string, mixed>  $changes
+     * @param  array<string, mixed>  $meta
+     */
+    private function writeChanges(Model $model, string $event, array $changes, ?array $restore = null, array $meta = []): void
     {
         $exclude = $this->rules->excludePatterns($model);
         $keys = array_values(array_filter(array_keys($changes), fn ($key) => ! Str::is($exclude, (string) $key)));
@@ -187,7 +245,7 @@ class AuditObserver
             return;
         }
 
-        $this->write($model, $event, old: $this->values($model, $old), new: $this->values($model, $new));
+        $this->write($model, $event, $meta, $this->values($model, $old), $this->values($model, $new));
     }
 
     private function write(Model $model, string $event, array $meta = [], array $old = [], array $new = []): void
@@ -201,7 +259,7 @@ class AuditObserver
             return false;
         }
 
-        $events = $model->auditEvents();
+        $events = method_exists($model, 'auditEvents') ? $model->auditEvents() : self::DEFAULT_EVENTS;
 
         return in_array($event, $events, true) || ($alias !== null && in_array($alias, $events, true));
     }
@@ -229,9 +287,10 @@ class AuditObserver
         return self::$restoring ??= new WeakMap;
     }
 
-    private function parentOf(Model $model): ?Model
+    /** The record this one rolls up to, as a model (a bare one when the host returned [Class, id]). Null for none. */
+    public function parentOf(Model $model): ?Model
     {
-        $parent = $model->auditParent();
+        $parent = method_exists($model, 'auditParent') ? $model->auditParent() : null;
 
         if ($parent instanceof Model) {
             return $parent;

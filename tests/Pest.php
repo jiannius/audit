@@ -35,3 +35,9 @@ function makeUser(array $attributes = []): User
         'password' => 'secret-password',
     ]);
 }
+
+/** Insert documents without a model, so no audit row exists yet. @return list<int> */
+function rawDocuments(array $rows): array
+{
+    return array_map(fn (array $row) => DB::table('documents')->insertGetId($row + ['title' => 'Doc', 'status' => 'draft', 'total' => 0]), $rows);
+}

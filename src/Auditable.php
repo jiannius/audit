@@ -92,7 +92,59 @@ trait Auditable
      */
     public function auditEvents(): array
     {
-        return ['created', 'updated', 'deleted', 'restored'];
+        return AuditObserver::DEFAULT_EVENTS;
+    }
+
+    /**
+     * Record a custom event on this model, category `action`: `$invoice->audit('sent', meta: ['to' => $emails])`.
+     * Old and new values follow the model's exclude and redact rules, so a secret passed in is never stored.
+     * It writes in the caller's transaction, if any, and throws if the insert fails.
+     *
+     * @param  array<string, mixed>  $meta
+     * @param  array<string, mixed>  $old
+     * @param  array<string, mixed>  $new
+     */
+    public function audit(string $event, array $meta = [], array $old = [], array $new = []): void
+    {
+        $observer = app(AuditObserver::class);
+
+        if ($observer->allows($this, $event)) {
+            $observer->recordAction($this, $event, $meta, $old, $new);
+        }
+    }
+
+    /**
+     * updateQuietly() that is audited: no model events fire, but the change is recorded as one row
+     * ($event, category `record`) from getPrevious() and getChanges(), in one transaction with it.
+     * If the audit insert fails the update rolls back and the model is left as a failed save() leaves it:
+     * the new values assigned and dirty, the originals and `exists` untouched, so a retry of save() works.
+     *
+     * @param  array<string, mixed>  $attributes
+     * @param  array<string, mixed>  $meta
+     */
+    public function updateQuietlyWithAudit(array $attributes, string $event = 'updated', array $meta = []): bool
+    {
+        $observer = app(AuditObserver::class);
+
+        if (! $this->exists || ! $observer->allows($this, $event)) {
+            return $this->updateQuietly($attributes);
+        }
+
+        // Filled before the transaction, so a failed insert leaves the model dirty and a retry of save() works.
+        $this->fill($attributes);
+
+        // A save with nothing dirty leaves the previous save's getChanges() in place: do not record that again.
+        $dirty = $this->isDirty();
+
+        return $this->auditTransaction(function () use ($dirty, $event, $meta, $observer) {
+            $saved = $this->saveQuietly();
+
+            if ($saved && $dirty) {
+                $observer->recordChanges($this, $event, $meta);
+            }
+
+            return $saved;
+        });
     }
 
     /**
