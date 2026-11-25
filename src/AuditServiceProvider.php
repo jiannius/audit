@@ -90,7 +90,8 @@ class AuditServiceProvider extends ServiceProvider
     public static function publishedMigrationPath(string $directory): string
     {
         foreach (glob(rtrim($directory, '/').'/*_create_audits_table.php') ?: [] as $file) {
-            if (str_contains((string) file_get_contents($file), self::MIGRATION_MARKER)) {
+            // The marker on a line of its own: a comment that merely quotes it does not count.
+            if (preg_match('/^'.preg_quote(self::MIGRATION_MARKER, '/').'[ \t]*\r?$/m', (string) file_get_contents($file)) === 1) {
                 return $file;
             }
         }

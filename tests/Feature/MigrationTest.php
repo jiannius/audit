@@ -114,6 +114,12 @@ describe('which migration publishing reuses', function () {
         expect(file_get_contents(__DIR__.'/../../database/migrations/create_audits_table.php.stub'))->toContain(AuditServiceProvider::MIGRATION_MARKER);
     });
 
+    it('recognises the stub itself as the v1 migration once it is published', function () {
+        $directory = migrationsDirectory(['2026_02_02_000000_create_audits_table.php' => file_get_contents(__DIR__.'/../../database/migrations/create_audits_table.php.stub')]);
+
+        expect(AuditServiceProvider::publishedMigrationPath($directory))->toBe($directory.'/2026_02_02_000000_create_audits_table.php');
+    });
+
     it('proposes a new file when there is no migration', function () {
         $path = AuditServiceProvider::publishedMigrationPath(migrationsDirectory([]));
 
@@ -135,6 +141,24 @@ describe('which migration publishing reuses', function () {
             ->and($path)->toEndWith('_create_audits_table.php')
             ->and(dirname($path))->toBe($directory);
     });
+
+    it('is not fooled by a comment that merely mentions the marker', function (string $decoy) {
+        $directory = migrationsDirectory(['2020_01_01_000000_create_audits_table.php' => "<?php\n\n".$decoy."\n"]);
+
+        expect(AuditServiceProvider::publishedMigrationPath($directory))->not->toBe($directory.'/2020_01_01_000000_create_audits_table.php');
+    })->with([
+        'a note quoting it' => ['// the v1 migration has // jiannius/audit v1 at the top'],
+        'text after it' => ['// jiannius/audit v1 is what the old package used to say'],
+        'indented' => ['    // jiannius/audit v1'],
+        'a block comment' => ['/* // jiannius/audit v1 */'],
+        'a docblock' => ["/**\n * Not the // jiannius/audit v1 file.\n */"],
+    ]);
+
+    it('recognises the marker with trailing spaces or Windows line endings', function (string $line) {
+        $directory = migrationsDirectory(['2026_01_01_000000_create_audits_table.php' => "<?php\n".$line."\nreturn 1;\n"]);
+
+        expect(AuditServiceProvider::publishedMigrationPath($directory))->toBe($directory.'/2026_01_01_000000_create_audits_table.php');
+    })->with(['trailing spaces' => ['// jiannius/audit v1   '], 'CRLF' => ["// jiannius/audit v1\r"]]);
 
     it('finds the v1 migration among others', function () {
         $directory = migrationsDirectory([

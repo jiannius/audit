@@ -62,7 +62,7 @@ composer require jiannius/audit
 php artisan vendor:publish --tag=audit-config --tag=audit-migrations
 ```
 
-Publish the migration **once**. While a v1 migration exists in `database/migrations`, publishing again leaves it alone instead of adding a second copy. The package recognises its own migration by the `// jiannius/audit v1` line at the top of the file, so keep that line in your copy (a copy published from an alpha tag does not have it: add the line). A `create_audits_table` migration without the line, such as the pre-1.0 package's, is never reused.
+Publish the migration **once**. While a v1 migration exists in `database/migrations`, publishing again leaves it alone instead of adding a second copy. The package recognises its own migration by the `// jiannius/audit v1` line at the top of the file, on a line of its own, so keep that line in your copy (a copy published from an alpha tag does not have it: add the line). A `create_audits_table` migration without the line, such as the pre-1.0 package's, is never reused.
 
 The package registers no global alias. Import the facade where you use it: `use Jiannius\Audit\Facades\Auditor;`.
 
