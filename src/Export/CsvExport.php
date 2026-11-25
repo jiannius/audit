@@ -99,9 +99,14 @@ final class CsvExport
         $this->scopeColumns = [];
 
         foreach ($columns as $column => $heading) {
-            is_int($column)
-                ? $this->scopeColumns[$heading] = Str::headline($heading)
-                : $this->scopeColumns[$column] = $heading;
+            $name = is_int($column) ? $heading : $column;
+
+            // A scope column named like one of ours would be written under the other's key and silently lost.
+            if (isset((self::COLUMNS + self::DETAILS)[$name])) {
+                throw new InvalidArgumentException("The scope column [{$name}] has the same name as an export column, so one of them would be dropped. Rename the scope column, or read it under another name.");
+            }
+
+            $this->scopeColumns[$name] = is_int($column) ? Str::headline($heading) : $heading;
         }
 
         return $this;
@@ -167,7 +172,11 @@ final class CsvExport
 
         $this->put($handle, $headings);
 
-        foreach ($this->query->lazyById(self::CHUNK) as $audit) {
+        // Paging by id appends its own order to the query's. Left in place, the query's order comes first and
+        // the pages overlap or skip rows, so it is dropped: the export is in id order, whatever the query asked for.
+        $query = (clone $this->query)->reorder();
+
+        foreach ($query->lazyById(self::CHUNK) as $audit) {
             foreach ($this->rowsOf($audit->getAttributes(), $formatter, $timezone) as $row) {
                 $this->put($handle, $row);
                 $count++;
@@ -287,7 +296,12 @@ final class CsvExport
 
     private function safe(string $text): string
     {
-        return $text !== '' && str_contains(self::INJECTION_CHARACTERS, $text[0]) ? "'".$text : $text;
+        // A plain number, such as a decimal column's '-150.00', is not a formula. Anchored, so '-2+3' and '-1e5' are.
+        if ($text === '' || ! str_contains(self::INJECTION_CHARACTERS, $text[0]) || preg_match('/\A-?\d+(\.\d+)?\z/D', $text) === 1) {
+            return $text;
+        }
+
+        return "'".$text;
     }
 
     /**

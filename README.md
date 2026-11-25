@@ -756,7 +756,7 @@ CsvExport::make(Audit::query()->between($from, $to))
 | `CsvExport::make(Builder\|Relation $query)` | The rows to export: any Eloquent builder over the audits, with your own filters applied. A builder over a [read scope](#8-multi-tenant) stays inside it |
 | `->formatter(FormatsAuditValues $formatter)` | Default: `app(FormatsAuditValues::class)`, which the package binds to `audit.formatter` |
 | `->timezone(DateTimeZone\|string\|null $timezone)` | The timezone of the Time column. Default: the application's, which is what rows are stored in |
-| `->scopeColumns(array $columns)` | Your scope columns, written after Request ID: `['team_id' => 'Team']`, or `['team_id']` for a heading made from the column name |
+| `->scopeColumns(array $columns)` | Your scope columns, written after Request ID: `['team_id' => 'Team']`, or `['team_id']` for a heading made from the column name. A column named like one of the export's own keys (`id`, `source`, `details` ...) throws, because one of the two would be dropped |
 | `->headings(array $headings)` | Replace a heading, by the column's key (below). An unknown key throws, listing the valid ones |
 | `->download(string $filename, array $headers = [])` | A `StreamedResponse` for a controller: `text/csv; charset=UTF-8`, an attachment, `Cache-Control: no-store, private`. Slashes and control characters in the name are replaced |
 | `->write($handle): int` | Writes the BOM, the headings and every row to an open stream, and returns the number of data rows (not counting the heading row) |
@@ -797,9 +797,9 @@ Set your implementation in `audit.formatter`, or rebind `FormatsAuditValues` in 
 | your scope columns | the heading you gave | One per key of `scopeColumns()` |
 | `details` | Details | `meta` as JSON, repeated on every row of the entry. It holds `_truncated` when a value was replaced by `"[truncated N bytes]"` |
 
-- **Streams.** The rows are read through `lazyById(1000)`, in `id` order whatever order the query asked for, and written as they go, so memory does not grow with the result. The query must select every column (no partial `select()`).
+- **Streams.** The rows are read through `lazyById(1000)`, in `id` order, and written as they go, so memory does not grow with the result. The query's own `orderBy()` is dropped (paging by id cannot honour it without skipping or repeating rows), so sort the file afterwards if you need another order. The query must select every column (no partial `select()`).
 - Starts with a UTF-8 BOM, so Excel reads the encoding correctly. Cells are written with `fputcsv` and an empty escape character.
-- **CSV-injection safety:** a string cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`. This covers every text cell, including the record label, the user's name and what your formatter returns. Numbers (PHP `int` and `float`) are written as they are, so have your formatter return numbers as numbers: a negative amount returned as the string `'-150.50'` would be prefixed.
+- **CSV-injection safety:** a string cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`. This covers every text cell, including the record label, the user's name and what your formatter returns. Numbers (PHP `int` and `float`) are written as they are, and so is a string that is only a plain decimal number (`-150.00`, matching `-?\d+(\.\d+)?`), so a decimal column's value keeps its sign. Anything else that starts with one of those characters is prefixed: `-2+3`, `-1e5`, `+60123456789`, `=1`.
 - An export is a sensitive file. You control who may run it.
 
 ---

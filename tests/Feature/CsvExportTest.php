@@ -163,12 +163,12 @@ describe('rows', function () {
         expect($rows)->toBe([CSV_HEADINGS]);
     });
 
-    it('reads in id order whatever order the query asked for, and applies the query', function () {
+    it('applies the filters of the query', function () {
         $first = insertedAudit(['event' => 'one']);
         $second = insertedAudit(['event' => 'two']);
         insertedAudit(['event' => 'other', 'category' => 'auth']);
 
-        $rows = csvRecords(CsvExport::make(Audit::query()->where('category', 'record')->orderByDesc('id')));
+        $rows = csvRecords(CsvExport::make(Audit::query()->where('category', 'record')));
 
         expect(array_column($rows, 'Audit ID'))->toBe([(string) $first, (string) $second]);
     });
@@ -182,6 +182,61 @@ describe('rows', function () {
         $rows = csvRecords(CsvExport::make(Audit::query()));
 
         expect(array_column($rows, 'Event'))->toBe(['mine']);
+    });
+});
+
+describe('a query with its own order', function () {
+    /** More rows than one chunk, with events that sort differently from their ids. */
+    function manyAudits(int $count, ?int $subject = null): void
+    {
+        $rows = [];
+
+        foreach (range(1, $count) as $i) {
+            $rows[] = ['category' => 'record', 'event' => 'e'.str_pad((string) (($i * 7919) % 997), 4, '0', STR_PAD_LEFT), 'subject_type' => 'document', 'subject_id' => (string) ($subject ?? 1), 'created_at' => '2026-11-'.str_pad((string) (1 + $i % 28), 2, '0', STR_PAD_LEFT).' 12:00:00'];
+        }
+
+        foreach (array_chunk($rows, 500) as $chunk) {
+            DB::table('audits')->insert($chunk);
+        }
+    }
+
+    it('exports every row exactly once, whatever the order', function (Closure $order) {
+        manyAudits(2500);
+
+        $ids = array_column(csvRecords(CsvExport::make($order(Audit::query()))), 'Audit ID');
+
+        expect($ids)->toHaveCount(2500)
+            ->and(count(array_unique($ids)))->toBe(2500)
+            ->and($ids)->toBe(array_map('strval', range(1, 2500)));
+    })->with([
+        'orderBy event' => [fn ($query) => $query->orderBy('event')],
+        'latest' => [fn ($query) => $query->latest()],
+        'orderByDesc id' => [fn ($query) => $query->orderByDesc('id')],
+        'several orders' => [fn ($query) => $query->orderBy('event')->orderByDesc('created_at')],
+        'an order by a raw expression' => [fn ($query) => $query->orderByRaw('event desc')],
+    ]);
+
+    it('does so through a relation too', function () {
+        manyAudits(2200, subject: 7);
+        manyAudits(300, subject: 8);
+
+        $document = new Jiannius\Audit\Tests\Fixtures\Document;
+        $document->setRawAttributes(['id' => 7]);
+        $document->exists = true;
+
+        $ids = array_column(csvRecords(CsvExport::make($document->audits()->orderBy('event'))), 'Audit ID');
+
+        expect($ids)->toHaveCount(2200)
+            ->and(count(array_unique($ids)))->toBe(2200);
+    });
+
+    it('leaves the query it was given alone', function () {
+        manyAudits(5);
+
+        $query = Audit::query()->orderBy('event');
+        csvText(CsvExport::make($query));
+
+        expect($query->toBase()->orders)->not->toBeEmpty();
     });
 });
 
@@ -225,6 +280,11 @@ describe('headings and scope columns', function () {
         expect(array_slice($rows[0], 18))->toBe(['Request ID', 'Team', 'Region Id', 'Details'])
             ->and(array_slice($rows[1], 18))->toBe(['', '5', '9', '{"a":1}']);
     });
+
+    it('refuses a scope column named like an export column, which would be dropped', function (string $column) {
+        expect(fn () => CsvExport::make(Audit::query())->scopeColumns([$column => 'Heading']))->toThrow(InvalidArgumentException::class, $column)
+            ->and(fn () => CsvExport::make(Audit::query())->scopeColumns([$column]))->toThrow(InvalidArgumentException::class);
+    })->with(['id', 'source', 'details', 'category', 'event', 'time']);
 
     it('lets a heading override a scope column heading', function () {
         $rows = csvRows(CsvExport::make(Audit::query())->scopeColumns(['team_id' => 'Team'])->headings(['team_id' => 'Workspace']));
@@ -368,13 +428,34 @@ describe('CSV injection', function () {
         expect(csvRecords(CsvExport::make(Audit::query()))[0]['Record'])->toBe($value);
     })->with(['a hyphen inside' => 'well-known', 'a number' => '12', 'a quote' => "'=safe", 'empty-ish' => ' =space first']);
 
-    it('does not prefix a negative number, only a string', function () {
-        insertedAudit(['new_values' => ['balance' => -500, 'ratio' => -0.5, 'text' => '-500']]);
+    it('does not prefix a negative number', function () {
+        insertedAudit(['new_values' => ['balance' => -500, 'ratio' => -0.5]]);
 
         $new = array_column(csvRecords(CsvExport::make(Audit::query())), 'New value', 'Field');
 
-        expect($new)->toEqual(['Balance' => '-500', 'Ratio' => '-0.5', 'Text' => "'-500"]);
+        expect($new)->toEqual(['Balance' => '-500', 'Ratio' => '-0.5']);
     });
+
+    it('does not prefix a numeric string either, such as a decimal column', function (string $value) {
+        insertedAudit(['new_values' => ['total' => $value]]);
+
+        expect(csvRecords(CsvExport::make(Audit::query()))[0]['New value'])->toBe($value);
+    })->with(['a negative decimal' => '-150.00', 'a negative integer' => '-500', 'a decimal' => '150.5', 'zero' => '-0']);
+
+    it('still prefixes a string that only starts like a number', function (string $value) {
+        insertedAudit(['new_values' => ['total' => $value]]);
+
+        expect(csvRecords(CsvExport::make(Audit::query()))[0]['New value'])->toBe("'".$value);
+    })->with([
+        'arithmetic' => '-2+3',
+        'an exponent' => '-1e5',
+        'a formula' => '=1',
+        'a plus sign' => '+60123456789',
+        'a trailing newline' => "-150\n",
+        'a trailing dot' => '-150.',
+        'a leading dot' => '-.5',
+        'two signs' => '--5',
+    ]);
 
     it('lets a formatter keep a negative amount a number', function () {
         insertedAudit(['subject_type' => 'invoice', 'new_values' => ['total' => -15050]]);
