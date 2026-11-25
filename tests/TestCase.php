@@ -90,6 +90,7 @@ abstract class TestCase extends Orchestra
             ]);
         }
 
+        $app['config']->set('app.key', 'base64:'.base64_encode(str_repeat('k', 32)));
         $app['config']->set('auth.providers.users.model', User::class);
         $app['config']->set('queue.default', 'database');
         $app['config']->set('queue.connections.database', [
