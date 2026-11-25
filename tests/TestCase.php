@@ -76,6 +76,7 @@ abstract class TestCase extends Orchestra
             ]);
         }
 
+        $app['config']->set('app.key', 'base64:'.base64_encode(str_repeat('k', 32)));
         $app['config']->set('auth.providers.users.model', User::class);
         $app['config']->set('queue.default', 'database');
         $app['config']->set('queue.connections.database', [
@@ -90,6 +91,20 @@ abstract class TestCase extends Orchestra
     {
         $router->get('/touch', function () {
             Auditor::record('touched');
+
+            return 'ok';
+        });
+
+        // Web-group routes that never touch the user, as plenty of real routes do not.
+        $router->middleware('web')->get('/touch-web', function () {
+            Auditor::record('touched');
+
+            return 'ok';
+        });
+
+        $router->middleware('web')->get('/resolve', function () {
+            auth()->user();
+            Auditor::record('resolved');
 
             return 'ok';
         });
