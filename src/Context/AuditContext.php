@@ -3,10 +3,15 @@
 namespace Jiannius\Audit\Context;
 
 use Closure;
+use Illuminate\Auth\SessionGuard;
+use Illuminate\Console\Scheduling\CallbackEvent;
+use Illuminate\Console\Scheduling\Event as ScheduledEvent;
 use Illuminate\Contracts\Auth\Authenticatable;
+use Illuminate\Contracts\Auth\Guard;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
  * Who is acting, from where, in which request. Registered as a scoped
@@ -32,9 +37,18 @@ class AuditContext
     /** @var array<string, Actor|null> */
     private array $contextKeyActors = [];
 
+    /** @var array<string, Actor|null> */
+    private array $sessionActors = [];
+
     /**
-     * First match wins: an actingAs() override, the signed-in user, the origin
-     * carried into a queued job, the configured Context key, then nobody.
+     * First match wins: an actingAs() override; inside a queued job, the origin
+     * carried from the dispatching process; the user signed in on the default
+     * guard; the configured Context key; then nobody.
+     *
+     * Inside a job the guard is never consulted. A long-running worker keeps
+     * its guards between jobs, so a job that signed someone in would otherwise
+     * leak that user into the next job. A job that really does act as someone
+     * else says so with actingAs().
      */
     public function actor(): ?Actor
     {
@@ -42,14 +56,22 @@ class AuditContext
             return $this->actorOverrides[array_key_last($this->actorOverrides)];
         }
 
-        // hasUser() on purpose: user() could trigger a remember-cookie login as a side effect.
+        $origin = $this->origin();
+
+        if ($this->inQueue() && array_key_exists('actor', $origin)) {
+            return Actor::fromArray($origin['actor']) ?? $this->actorFromContextKey();
+        }
+
         $guard = Auth::guard();
 
+        // hasUser() on purpose: user() could trigger a remember-cookie login as a side effect.
         if ($guard->hasUser()) {
             return Actor::from($guard->user());
         }
 
-        return Actor::fromArray($this->origin()['actor'] ?? null) ?? $this->actorFromContextKey();
+        return $this->actorFromSession($guard)
+            ?? Actor::fromArray($origin['actor'] ?? null)
+            ?? $this->actorFromContextKey();
     }
 
     public function actingAs(?Authenticatable $actor, Closure $callback): mixed
@@ -105,6 +127,12 @@ class AuditContext
         }
     }
 
+    /** Name a scheduled task for the source. Never the command line: arguments and paths can carry secrets. */
+    public function enterTask(ScheduledEvent $task): void
+    {
+        $this->enter('schedule', 'schedule:'.$this->taskName($task));
+    }
+
     public function requestId(): string
     {
         $key = config('audit.request_id.context_key');
@@ -147,19 +175,30 @@ class AuditContext
     }
 
     /**
-     * What goes into hidden Context when a job is dispatched: the actor, the
-     * request id and where it all started. A job dispatched from a job passes
-     * the same origin on.
+     * What goes into hidden Context when a job is dispatched: the actor and the
+     * request id. A job dispatched from a job passes the same origin on.
      *
-     * @return array{actor: ?array, request_id: string, source: string}
+     * A queue dispatch is not an audit write, so this never throws: an actor
+     * that cannot be snapshotted (for example a class missing from an enforced
+     * morph map) is carried as nobody.
+     *
+     * @return array{actor: ?array, request_id: string}
      */
     public function dispatchOrigin(): array
     {
-        return [
-            'actor' => $this->actor()?->toArray(),
-            'request_id' => $this->requestId(),
-            'source' => $this->origin()['source'] ?? $this->source(),
-        ];
+        try {
+            $actor = $this->actor()?->toArray();
+        } catch (Throwable) {
+            $actor = null;
+        }
+
+        try {
+            $requestId = $this->requestId();
+        } catch (Throwable) {
+            $requestId = (string) Str::ulid();
+        }
+
+        return ['actor' => $actor, 'request_id' => $requestId];
     }
 
     /** @return array<string, mixed> */
@@ -168,6 +207,61 @@ class AuditContext
         $origin = Context::getHidden(self::ORIGIN_KEY);
 
         return is_array($origin) ? $origin : [];
+    }
+
+    private function inQueue(): bool
+    {
+        foreach ($this->frames as $frame) {
+            if ($frame['kind'] === 'queue') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * A session login on a route that never resolved the user. The user is
+     * looked up from the session's login id through the provider, which has no
+     * side effects: no Authenticated event, and never the remember-cookie path.
+     */
+    private function actorFromSession(Guard $guard): ?Actor
+    {
+        if (! $guard instanceof SessionGuard) {
+            return null;
+        }
+
+        $id = $guard->getSession()->get($guard->getName());
+
+        if (! is_string($id) && ! is_int($id)) {
+            return null;
+        }
+
+        $key = (string) $id;
+
+        if (! array_key_exists($key, $this->sessionActors)) {
+            $this->sessionActors[$key] = Actor::from($guard->getProvider()->retrieveById($id));
+        }
+
+        return $this->sessionActors[$key];
+    }
+
+    private function taskName(ScheduledEvent $task): string
+    {
+        if (is_string($task->description) && $task->description !== '') {
+            return $task->description;
+        }
+
+        if ($task instanceof CallbackEvent) {
+            return $task->getSummaryForDisplay();
+        }
+
+        // A shell task: its name is the artisan command, without arguments. Any other command line stays out.
+        if (preg_match('/artisan[\'"]?\s+([\w:.\-]+)/', (string) $task->command, $match)) {
+            return $match[1];
+        }
+
+        return 'command';
     }
 
     private function actorFromContextKey(): ?Actor

@@ -89,7 +89,7 @@ class Audit extends Model
     /** The record this row is about. Null once it is gone; never auto-loaded. */
     public function subject(): MorphTo
     {
-        return $this->morphTo('subject', 'subject_type', 'subject_id');
+        return $this->morphTo('subject', 'subject_type', 'subject_id')->withTrashed();
     }
 
     public function parent(): MorphTo
@@ -164,6 +164,7 @@ class Audit extends Model
         $callable = is_callable($read) && ! is_string($read) ? $read : app($read);
         $value = $callable();
 
-        return is_scalar($value) ? $value : null;
+        // Only a real id counts. A boolean, a float or an empty string is a bug in the resolver: show nothing.
+        return (is_string($value) && $value !== '') || is_int($value) ? $value : null;
     }
 }

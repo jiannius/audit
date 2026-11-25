@@ -109,6 +109,20 @@ abstract class TestCase extends Orchestra
             return 'ok';
         });
 
+        // Web-group routes that never touch the user, as plenty of real routes do not.
+        $router->middleware('web')->get('/touch-web', function () {
+            Auditor::record('touched');
+
+            return 'ok';
+        });
+
+        $router->middleware('web')->get('/resolve', function () {
+            auth()->user();
+            Auditor::record('resolved');
+
+            return 'ok';
+        });
+
         $router->get('/dispatch', function () {
             Auditor::record('dispatching');
             RecordActorJob::dispatch('single');

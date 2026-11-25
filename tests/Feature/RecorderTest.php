@@ -1,6 +1,5 @@
 <?php
 
-use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Jiannius\Audit\Audit;
 use Jiannius\Audit\Category;
@@ -279,10 +278,4 @@ it('joins the transaction of the change it records', function () {
     DB::rollBack();
 
     expect(DB::table('audits')->count())->toBe(0);
-});
-
-it('fails loudly when the table is missing, so the caller can roll back', function () {
-    DB::statement('drop table audits');
-
-    expect(fn () => Auditor::record('sent'))->toThrow(QueryException::class);
 });

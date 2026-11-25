@@ -9,6 +9,7 @@ return [
     'connection' => null,                      // null: the subject's connection (shares its transaction)
     'transactional_saves' => true,             // the off switch is for hosts that cannot accept saved-hook rollbacks
     'model' => Audit::class,
+    'max_value_bytes' => 65536,                // a string in old/new/meta over this is stored as "[truncated N bytes]"
 
     'attributes' => [
         'exclude' => ['created_at', 'updated_at', 'remember_token', '*_token', '*_secret', 'two_factor_recovery_codes'],
