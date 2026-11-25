@@ -387,3 +387,142 @@ describe('Auditor::update on a base query builder', function () {
         expect(DB::table('invoices')->value('number'))->toBe('INV-1');
     });
 });
+
+describe('Auditor::update: table aliases and qualifiers', function () {
+    it('records a column qualified with the query\'s alias', function () {
+        [$id] = rawDocuments([['title' => 'A', 'total' => 1]]);
+
+        $count = Auditor::update(DB::table('documents as d')->where('d.id', $id), ['d.total' => 5], subjectType: 'document');
+
+        expect($count)->toBe(1)
+            ->and($this->audits())->toHaveCount(1)
+            ->and($this->audits()->first()->old_values)->toEqual(['total' => 1])
+            ->and($this->audits()->first()->new_values)->toEqual(['total' => 5]);
+    });
+
+    it('records an unqualified column on an aliased Eloquent query', function () {
+        [$id] = rawDocuments([['title' => 'A', 'total' => 1]]);
+
+        Auditor::update(Document::query()->from('documents as d')->where('d.id', $id), ['total' => 5]);
+
+        expect($this->audits()->first()->new_values)->toEqual(['total' => 5]);
+    });
+
+    it('throws for a column qualified with something that is neither the table nor its alias, and writes nothing', function () {
+        [$id] = rawDocuments([['title' => 'A', 'total' => 1]]);
+
+        expect(fn () => Auditor::update(DB::table('documents as d')->where('d.id', $id), ['x.total' => 5], subjectType: 'document'))
+            ->toThrow(InvalidArgumentException::class, 'neither the audited table [documents] nor its alias [d]');
+
+        expect(DB::table('documents')->value('total'))->toBe(1)
+            ->and($this->audits())->toHaveCount(0);
+    });
+});
+
+describe('Auditor::update and delete: the audited set is the written set', function () {
+    it('refuses a limit or an offset on a joined query, which the database would ignore', function () {
+        $user = AuditedUser::create(['name' => 'Ada', 'email' => 'ada@example.test', 'password' => 'x']);
+        $team = Team::create(['name' => 'T1']);
+        $user->teams()->attach($team->id);
+        DB::table('audits')->delete();
+
+        expect(fn () => Auditor::update($user->teams()->limit(1), ['name' => 'X']))->toThrow(InvalidArgumentException::class, 'joins')
+            ->and(fn () => Auditor::update($user->teams()->offset(1), ['name' => 'X']))->toThrow(InvalidArgumentException::class, 'joins')
+            ->and(fn () => Auditor::delete($user->teams()->limit(1)))->toThrow(InvalidArgumentException::class, 'joins');
+
+        expect(DB::table('teams')->value('name'))->toBe('T1');
+    });
+
+    it('rolls an update back when the write touches a row the audit did not see', function () {
+        rawDocuments([['title' => 'A', 'total' => 1]]);
+        $armed = true;
+
+        // A row that matches the WHERE appears between the locked select and the write.
+        DB::listen(function ($query) use (&$armed) {
+            if ($armed && str_starts_with($query->sql, 'select')) {
+                $armed = false;
+                DB::table('documents')->insert(['title' => 'Phantom', 'status' => 'draft', 'total' => 1]);
+            }
+        });
+
+        expect(fn () => Auditor::update(Document::query()->where('total', 1), ['total' => 2]))
+            ->toThrow(RuntimeException::class, 'affected 2 rows but only 1 were audited');
+
+        expect(DB::table('documents')->pluck('total')->all())->toBe([1])
+            ->and($this->audits())->toHaveCount(0);
+    });
+
+    it('rolls a delete back when the write touches a row the audit did not see', function () {
+        rawDocuments([['title' => 'A', 'total' => 1]]);
+        $armed = true;
+
+        DB::listen(function ($query) use (&$armed) {
+            if ($armed && str_starts_with($query->sql, 'select')) {
+                $armed = false;
+                DB::table('documents')->insert(['title' => 'Phantom', 'status' => 'draft', 'total' => 1]);
+            }
+        });
+
+        expect(fn () => Auditor::delete(Document::query()->where('total', 1), event: 'force_deleted'))
+            ->toThrow(RuntimeException::class, 'affected 2 rows but only 1 were audited');
+
+        // The phantom was inserted inside the transaction, so it went with it: only the original is left.
+        expect(DB::table('documents')->pluck('title')->all())->toBe(['A'])
+            ->and($this->audits())->toHaveCount(0);
+    });
+
+    it('locks the rows in primary key order', function () {
+        rawDocuments([['title' => 'A'], ['title' => 'B']]);
+        $selects = [];
+        DB::listen(function ($query) use (&$selects) {
+            if (str_starts_with($query->sql, 'select')) {
+                $selects[] = $query->sql;
+            }
+        });
+
+        Auditor::update(Document::query(), ['status' => 'sent']);
+
+        expect($selects[0])->toMatch('/order by [`"]documents[`"]\.[`"]id[`"]/');
+    });
+});
+
+describe('Auditor::update and delete through a has-many-through relation', function () {
+    it('updates the far records and records one row each, with the line\'s own parent', function () {
+        $user = AuditedUser::create(['name' => 'Ada', 'email' => 'ada@example.test', 'password' => 'x']);
+        $mine = AuditedInvoice::create(['number' => 'INV-1', 'user_id' => $user->id]);
+        $theirs = AuditedInvoice::create(['number' => 'INV-2', 'user_id' => $user->id + 100]);
+        DB::table('invoice_lines')->insert([
+            ['invoice_id' => $mine->id, 'description' => 'Widget', 'quantity' => 1],
+            ['invoice_id' => $mine->id, 'description' => 'Gadget', 'quantity' => 2],
+            ['invoice_id' => $theirs->id, 'description' => 'Other', 'quantity' => 3],
+        ]);
+        DB::table('audits')->delete();
+
+        $count = Auditor::update($user->lines(), ['quantity' => DB::raw('quantity + 10')]);
+
+        $audits = $this->audits();
+
+        expect($count)->toBe(2)
+            ->and($audits->pluck('subject_label')->all())->toBe(['Widget', 'Gadget'])
+            ->and($audits->pluck('parent_id')->unique()->all())->toBe([$mine->id])
+            ->and($audits[0]->new_values)->toEqual(['quantity' => 11])
+            ->and(DB::table('invoice_lines')->where('description', 'Other')->value('quantity'))->toBe(3);
+    });
+
+    it('deletes the far records with a row each', function () {
+        $user = AuditedUser::create(['name' => 'Ada', 'email' => 'ada@example.test', 'password' => 'x']);
+        $mine = AuditedInvoice::create(['number' => 'INV-1', 'user_id' => $user->id]);
+        $theirs = AuditedInvoice::create(['number' => 'INV-2', 'user_id' => $user->id + 100]);
+        DB::table('invoice_lines')->insert([
+            ['invoice_id' => $mine->id, 'description' => 'Widget'],
+            ['invoice_id' => $theirs->id, 'description' => 'Other'],
+        ]);
+        DB::table('audits')->delete();
+
+        $count = Auditor::delete($user->lines());
+
+        expect($count)->toBe(1)
+            ->and(DB::table('invoice_lines')->pluck('description')->all())->toBe(['Other'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['Widget']);
+    });
+});

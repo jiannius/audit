@@ -221,3 +221,77 @@ describe('Auditor::pivot', function () {
         expect(fn () => Auditor::pivot($user->teams(), fn () => null))->toThrow(InvalidArgumentException::class, 'saved');
     });
 });
+
+describe('Auditor::pivot field name', function () {
+    it('names the field after the relation method', function () {
+        [$one] = teams();
+        $user = member();
+
+        Auditor::pivot($user->teams(), fn ($teams) => $teams->attach($one));
+
+        expect($this->audits()->first()->new_values)->toHaveKey('teams');
+    });
+
+    it('falls back to the related table when the relation name is a backtrace guess', function () {
+        [$one] = teams();
+        $user = member();
+        // Built inside a closure, Laravel guesses the name from the backtrace and gets a closure.
+        $relation = (fn () => $user->belongsToMany(Team::class, 'team_user', 'user_id', 'team_id'))();
+
+        Auditor::pivot($relation, fn ($teams) => $teams->attach($one));
+
+        expect(array_keys($this->audits()->first()->new_values))->toBe(['teams'])
+            ->and(everythingAudited())->not->toContain('closure')->not->toContain('.php');
+    });
+
+    it('takes the field as an argument', function () {
+        [$one] = teams();
+        $user = member();
+
+        Auditor::pivot($user->teams(), fn ($teams) => $teams->attach($one), field: 'memberships');
+
+        expect($this->audits()->first()->new_values)->toEqual(['memberships' => [$one]]);
+    });
+});
+
+describe('Auditor::pivot with duplicate links', function () {
+    it('records a second link to the same record, as a repeated id in the list', function () {
+        [$one, $two] = teams();
+        $user = member();
+        $user->memberships()->attach([$one, $two]);
+        DB::table('audits')->delete();
+
+        Auditor::pivot($user->memberships(), fn ($teams) => $teams->attach($one));
+
+        $audit = $this->audits()->first();
+
+        expect($this->audits())->toHaveCount(1)
+            ->and($audit->old_values)->toEqual(['memberships' => [$one, $two]])
+            ->and($audit->new_values)->toEqual(['memberships' => [$one, $one, $two]]);
+    });
+
+    it('records a duplicate in the map form as a list of the column sets for that id', function () {
+        [$one] = teams();
+        $user = member();
+        $user->roleMemberships()->attach($one, ['role' => 'member']);
+        DB::table('audits')->delete();
+
+        Auditor::pivot($user->roleMemberships(), fn ($teams) => $teams->attach($one, ['role' => 'admin']));
+
+        $audit = $this->audits()->first();
+
+        expect($audit->old_values['roleMemberships'][$one])->toEqual(['role' => 'member'])
+            ->and($audit->new_values['roleMemberships'][$one])->toEqual([['role' => 'admin'], ['role' => 'member']]);
+    });
+
+    it('writes nothing when duplicates are unchanged', function () {
+        [$one] = teams();
+        $user = member();
+        $user->memberships()->attach([$one, $one]);
+        DB::table('audits')->delete();
+
+        Auditor::pivot($user->memberships(), fn () => null);
+
+        expect($this->audits())->toHaveCount(0);
+    });
+});

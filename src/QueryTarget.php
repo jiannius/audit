@@ -27,7 +27,7 @@ final class QueryTarget
     ) {}
 
     /**
-     * @param  bool  $withTrashed  drop the soft-delete scope, as forceDelete() does
+     * @param  bool  $withTrashed  drop the soft-delete scope (and only that one: other global scopes still apply)
      */
     public static function of(EloquentBuilder|Relation|QueryBuilder $query, ?string $subjectType = null, bool $withTrashed = false): self
     {
@@ -62,6 +62,23 @@ final class QueryTarget
         return self::fromParts($this->base)[0];
     }
 
+    /** The name the query refers to its table by: the alias when it has one, else the table. */
+    public function alias(): string
+    {
+        return self::fromParts($this->base)[1];
+    }
+
+    /**
+     * Refuse a query whose audited set could differ from its written set. Laravel's MySQL grammar drops
+     * ORDER BY and LIMIT from an UPDATE or DELETE that has joins, but the locked select would keep them.
+     */
+    public function assertWritable(): void
+    {
+        if ($this->base->joins && ($this->base->limit !== null || $this->base->offset !== null)) {
+            throw new InvalidArgumentException('Auditor cannot audit an update or delete that combines joins (a many-to-many or has-many-through relation counts) with limit() or offset(): the database ignores the limit on a joined write, so the audited rows could differ from the written ones. Select the keys first and use whereKey().');
+        }
+    }
+
     /** Whether the model soft deletes, which makes an Eloquent builder's delete() a soft delete. */
     public function softDeletes(): bool
     {
@@ -84,7 +101,10 @@ final class QueryTarget
         $query = $this->base->cloneWithout(['columns'])->cloneWithoutBindings(['select']);
 
         // A join would make a bare * pull in the other tables' columns.
-        $query->select($this->base->joins ? self::fromParts($this->base)[1].'.*' : '*')->lockForUpdate();
+        // Ordered by key, so two audited writes lock overlapping rows in the same order.
+        $query->select($this->base->joins ? $this->alias().'.*' : '*')
+            ->orderBy($this->alias().'.'.$this->keyName())
+            ->lockForUpdate();
 
         return $this->keyed($query->get());
     }

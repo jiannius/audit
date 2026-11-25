@@ -12,6 +12,7 @@ use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Jiannius\Audit\Context\AuditContext;
+use RuntimeException;
 
 /**
  * The logger and the write helpers. Use it through the Auditor facade.
@@ -22,6 +23,9 @@ use Jiannius\Audit\Context\AuditContext;
  */
 class Auditor
 {
+    /** Keys per re-read, and per batch of recorded rows. */
+    private const CHUNK = 1000;
+
     public function __construct(
         protected Recorder $recorder,
         protected AuditObserver $observer,
@@ -70,48 +74,46 @@ class Auditor
             return $query->update($values);
         }
 
+        $target->assertWritable();
         $columns = $this->writtenColumns($target, $values);
 
         return $target->connection()->transaction(function () use ($query, $target, $values, $columns, $event, $meta) {
             $before = $target->lockedRows();
             $affected = $query->update($values);
 
-            if ($before === []) {
-                return $affected;
-            }
+            $this->assertSameSet($before, $affected);
 
-            $after = $target->rowsByKey(array_column($before, $target->keyName()));
+            // The new state is read back one chunk at a time, so only the before-snapshot is held in full.
+            foreach (array_chunk(array_column($before, $target->keyName()), self::CHUNK) as $keys) {
+                $after = $target->rowsByKey($keys);
 
-            foreach ($before as $key => $row) {
-                if (! isset($after[$key])) {
-                    continue;
-                }
+                foreach ($after as $key => $row) {
+                    $old = $new = [];
 
-                $old = $new = [];
+                    foreach ($columns as $column) {
+                        $was = $before[$key][$column] ?? null;
+                        $now = $row[$column] ?? null;
 
-                foreach ($columns as $column) {
-                    $was = $row[$column] ?? null;
-                    $now = $after[$key][$column] ?? null;
-
-                    if (! $this->same($was, $now)) {
-                        $old[$column] = $was;
-                        $new[$column] = $now;
+                        if (! $this->same($was, $now)) {
+                            $old[$column] = $was;
+                            $new[$column] = $now;
+                        }
                     }
+
+                    // Rows the update left as they were, and changes to excluded columns only, leave nothing to record.
+                    if ($new === []) {
+                        continue;
+                    }
+
+                    $subject = $target->hydrate($row);
+                    $new = $this->rules->values($subject, $new);
+
+                    if ($new === []) {
+                        continue;
+                    }
+
+                    $this->record($event, $subject, $meta, $this->rules->values($subject, $old), $new, Category::RECORD, $this->observer->parentOf($subject));
                 }
-
-                // Rows the update left as they were, and changes to excluded columns only, leave nothing to record.
-                if ($new === []) {
-                    continue;
-                }
-
-                $subject = $target->hydrate($after[$key]);
-                $new = $this->rules->values($subject, $new);
-
-                if ($new === []) {
-                    continue;
-                }
-
-                $this->record($event, $subject, $meta, $this->rules->values($subject, $old), $new, Category::RECORD, $this->observer->parentOf($subject));
             }
 
             return $affected;
@@ -123,8 +125,13 @@ class Auditor
      *
      * On an Eloquent builder or relation of a soft-deleting model this soft deletes, as Laravel's builder
      * does, and each row has meta.soft = true. Everything else is a hard delete with meta.soft = false.
-     * With $event = 'force_deleted' a soft-deleting model's rows (trashed ones too) are deleted for good,
-     * as forceDelete() does, and meta.soft is left out, as the observer does.
+     *
+     * A soft delete records the row as the model's own delete() does: the attributes after the soft delete,
+     * so `deleted_at` holds the new timestamp, and meta.soft. A hard delete records the row as it was.
+     *
+     * With $event = 'force_deleted' a soft-deleting model's rows are deleted for good, trashed ones too:
+     * the soft-delete scope is dropped, and only that one. The model's other global scopes still apply
+     * (Laravel's own forceDelete() drops them all). meta.soft is left out, as the observer does.
      *
      * @param  array<string, mixed>  $meta
      * @return int the number of rows the delete affected
@@ -140,22 +147,25 @@ class Auditor
             return $run();
         }
 
+        $target->assertWritable();
+
         return $target->connection()->transaction(function () use ($run, $target, $event, $meta, $force, $soft) {
-            $rows = $target->lockedRows();
+            $before = $target->lockedRows();
             $affected = $run();
 
-            foreach ($rows as $row) {
-                $subject = $target->hydrate($row);
+            $this->assertSameSet($before, $affected);
 
-                $this->record(
-                    $event,
-                    $subject,
-                    $force ? $meta : [...$meta, 'soft' => $soft],
-                    $this->rules->values($subject, $row),
-                    [],
-                    Category::RECORD,
-                    $this->observer->parentOf($subject),
-                );
+            $meta = $force ? $meta : [...$meta, 'soft' => $soft];
+
+            foreach (array_chunk(array_column($before, $target->keyName()), self::CHUNK) as $keys) {
+                // A soft delete is recorded as the model records it, with the new deleted_at: read the rows back.
+                $rows = $soft ? $target->rowsByKey($keys) : array_intersect_key($before, array_flip(array_map('strval', $keys)));
+
+                foreach ($rows as $key => $row) {
+                    $subject = $target->hydrate($row);
+
+                    $this->record($event, $subject, $meta, $this->rules->values($subject, $row), [], Category::RECORD, $this->observer->parentOf($subject));
+                }
             }
 
             return $affected;
@@ -172,13 +182,17 @@ class Auditor
      *   - a relation with no pivot columns: a sorted list of the related ids, [1, 2, 5];
      *   - a relation with pivot columns (withPivot): a map of related id to its columns,
      *     {"1": {"role": "admin"}, "2": {"role": "member"}}, sorted by id.
-     * Timestamp columns are left out, and so are excluded attributes; redacted ones read "[redacted]".
+     * An id linked more than once (a pivot table with no unique key) is repeated in the list; in the map,
+     * its value is a list of the column sets, ordered by their JSON. Timestamp columns are left out, and
+     * so are excluded attributes; redacted ones read "[redacted]".
+     *
+     * The field is the relation's method name when it can be told, else the related table. Pass $field to set it.
      *
      * @param  Closure(BelongsToMany): mixed  $write  receives the relation
      * @param  array<string, mixed>  $meta
      * @return mixed what $write returned
      */
-    public function pivot(BelongsToMany $relation, Closure $write, string $event = 'updated', array $meta = []): mixed
+    public function pivot(BelongsToMany $relation, Closure $write, string $event = 'updated', array $meta = [], ?string $field = null): mixed
     {
         $parent = $relation->getParent();
 
@@ -190,7 +204,7 @@ class Auditor
             throw new InvalidArgumentException('The relation\'s parent ['.$parent::class.'] must be saved before its pivot can be audited.');
         }
 
-        return $parent->getConnection()->transaction(function () use ($relation, $write, $parent, $event, $meta) {
+        return $parent->getConnection()->transaction(function () use ($relation, $write, $parent, $event, $meta, $field) {
             $pivot = $relation->newPivot();
             $withColumns = $this->pivotColumns($relation, $pivot) !== [];
             $before = $this->pivotSnapshot($relation, $pivot, lock: true);
@@ -198,7 +212,7 @@ class Auditor
             $after = $this->pivotSnapshot($relation, $pivot);
 
             if ($before !== $after) {
-                $field = $relation->getRelationName() ?: $relation->getRelated()->getTable();
+                $field ??= $this->pivotField($relation);
 
                 $this->record(
                     $event,
@@ -233,7 +247,8 @@ class Auditor
     }
 
     /**
-     * The columns the update writes, as plain column names: a table qualifier and a JSON path are removed.
+     * The columns the update writes, as plain column names: a qualifier (the table or its alias) and a JSON path are removed.
+     * A column qualified with anything else throws.
      *
      * @param  array<string, mixed>  $values
      * @return list<string>
@@ -246,11 +261,11 @@ class Auditor
             $column = Str::before((string) $key, '->');
 
             if (str_contains($column, '.')) {
-                [$table, $column] = explode('.', $column, 2);
+                [$qualifier, $column] = explode('.', $column, 2);
 
-                // A column of a joined table is not on the audited record.
-                if ($table !== $target->table() && $table !== $target->model->getTable()) {
-                    continue;
+                // Skipping a column we cannot place would write a change with no row, so refuse it.
+                if ($qualifier !== $target->alias() && $qualifier !== $target->table()) {
+                    throw new InvalidArgumentException(sprintf('Auditor cannot audit the column [%s]: its qualifier [%s] is neither the audited table [%s] nor its alias [%s].', $key, $qualifier, $target->table(), $target->alias()));
                 }
             }
 
@@ -272,7 +287,9 @@ class Auditor
 
     /**
      * The pivot rows now, as the old or new value of the relation's field: a sorted list of related ids,
-     * or, with pivot columns, a map of id to columns. Raw values; excluded columns are already gone.
+     * or, with pivot columns, a map of id to columns. An id linked more than once is repeated in the list;
+     * in the map its value is a list of its column sets, in JSON order. Raw values; excluded columns are
+     * already gone.
      *
      * @return array<int|string, mixed>
      */
@@ -287,26 +304,29 @@ class Auditor
             $query->lockForUpdate();
         }
 
-        $rows = [];
+        $rows = array_map(fn ($row) => (array) $row, $query->get()->all());
 
-        foreach ($query->get() as $row) {
-            $row = (array) $row;
-            $rows[(string) $row[$idColumn]] = $row;
-        }
-
-        uksort($rows, strnatcmp(...));
+        usort($rows, fn (array $a, array $b) => strnatcmp((string) $a[$idColumn], (string) $b[$idColumn]));
 
         if ($columns === []) {
-            return array_values(array_map(fn (array $row) => $row[$idColumn], $rows));
+            return array_map(fn (array $row) => $row[$idColumn], $rows);
         }
 
-        $map = [];
+        $grouped = [];
 
         foreach ($rows as $row) {
-            $map[$row[$idColumn]] = array_intersect_key($row, array_flip($columns));
+            $grouped[$row[$idColumn]][] = array_intersect_key($row, array_flip($columns));
         }
 
-        return $map;
+        return array_map(function (array $sets) {
+            if (count($sets) === 1) {
+                return $sets[0];
+            }
+
+            usort($sets, fn (array $a, array $b) => strcmp(json_encode($a), json_encode($b)));
+
+            return $sets;
+        }, $grouped);
     }
 
     /**
@@ -325,13 +345,41 @@ class Auditor
     }
 
     /**
-     * Redact the pivot columns that are secret, in a map of related id to columns.
+     * Redact the pivot columns that are secret, in a map of related id to columns (or to a list of column sets).
      *
-     * @param  array<int|string, array<string, mixed>>  $snapshot
-     * @return array<int|string, array<string, mixed>>
+     * @param  array<int|string, array<int|string, mixed>>  $snapshot
+     * @return array<int|string, array<int|string, mixed>>
      */
     private function redactPivot(Model $pivot, array $snapshot): array
     {
-        return array_map(fn (array $columns) => $this->rules->values($pivot, $columns), $snapshot);
+        return array_map(
+            fn (array $columns) => array_is_list($columns) ? array_map(fn (array $set) => $this->rules->values($pivot, $set), $columns) : $this->rules->values($pivot, $columns),
+            $snapshot,
+        );
+    }
+
+    /** The relation's method name when it is one, else the related table: a backtrace guess can name a closure and a file path. */
+    private function pivotField(BelongsToMany $relation): string
+    {
+        $name = $relation->getRelationName();
+
+        if (is_string($name) && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) && method_exists($relation->getParent(), $name)) {
+            return $name;
+        }
+
+        return $relation->getRelated()->getTable();
+    }
+
+    /**
+     * The write must have touched exactly the rows that were locked and snapshotted. More means rows were
+     * written that have no audit row (a phantom insert, or a limit the database ignores): roll back.
+     *
+     * @param  array<string, array<string, mixed>>  $locked
+     */
+    private function assertSameSet(array $locked, int $affected): void
+    {
+        if ($affected > count($locked)) {
+            throw new RuntimeException(sprintf('The write affected %d rows but only %d were audited (rows changed between the select and the write). Nothing was written; retry.', $affected, count($locked)));
+        }
     }
 }

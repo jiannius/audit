@@ -9,6 +9,7 @@ use Jiannius\Audit\Tests\Fixtures\AuditedInvoice;
 use Jiannius\Audit\Tests\Fixtures\AuditedLine;
 use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\Invoice;
+use Jiannius\Audit\Tests\Fixtures\LockedDocument;
 use Jiannius\Audit\Tests\Fixtures\Order;
 
 describe('Auditor::delete', function () {
@@ -28,16 +29,18 @@ describe('Auditor::delete', function () {
             ->and($audits->pluck('subject_id')->all())->toBe([(string) $b, (string) $c])
             ->and($audits->pluck('meta')->unique()->all())->toEqual([['soft' => true]])
             ->and($audits[0]->subject_label)->toBe('B')
-            ->and($audits[0]->old_values)->toMatchArray(['id' => $b, 'title' => 'B', 'total' => 2, 'deleted_at' => null])
+            ->and($audits[0]->old_values)->toMatchArray(['id' => $b, 'title' => 'B', 'total' => 2])
+            ->and($audits[0]->old_values['deleted_at'])->not->toBeNull()
             ->and($audits[0]->new_values)->toBeNull();
     });
 
-    it('records the same snapshot the model\'s own delete() does', function () {
+    it('records a soft delete in the shape the model\'s own delete() records', function () {
         $viaModel = makeDocument(['title' => 'Same']);
         $viaHelper = makeDocument(['title' => 'Same']);
         DB::table('audits')->delete();
 
-        $viaModel->delete();
+        // Loaded from the database, so both carry every column.
+        Document::find($viaModel->getKey())->delete();
         Auditor::delete(Document::query()->whereKey($viaHelper->getKey()));
 
         [$model, $helper] = [$this->audits()[0], $this->audits()[1]];
@@ -45,7 +48,36 @@ describe('Auditor::delete', function () {
         expect($helper->event)->toBe($model->event)
             ->and($helper->meta)->toEqual($model->meta)
             ->and($helper->subject_label)->toBe($model->subject_label)
-            ->and($helper->old_values)->toMatchArray(['title' => 'Same', 'total' => 100, 'status' => 'draft']);
+            ->and(array_keys($helper->old_values))->toEqualCanonicalizing(array_keys($model->old_values))
+            ->and($helper->old_values['deleted_at'])->not->toBeNull()
+            ->and($model->old_values['deleted_at'])->not->toBeNull();
+    });
+
+    it('records a hard delete as the row was', function () {
+        rawDocuments([['title' => 'A']]);
+
+        Auditor::delete(Document::query(), event: 'force_deleted');
+
+        expect($this->audits()->first()->old_values['deleted_at'])->toBeNull();
+    });
+
+    it('force deletes only past the soft-delete scope: the model\'s own global scopes still apply', function () {
+        rawDocuments([['title' => 'Open', 'status' => 'draft'], ['title' => 'Locked', 'status' => 'locked'], ['title' => 'Trashed', 'status' => 'draft', 'deleted_at' => '2026-01-01 00:00:00']]);
+
+        $count = Auditor::delete(LockedDocument::query(), event: 'force_deleted');
+
+        expect($count)->toBe(2)
+            ->and(DB::table('documents')->pluck('title')->all())->toBe(['Locked'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['Open', 'Trashed']);
+    });
+
+    it('soft deletes already-trashed rows again with withTrashed(), and records them', function () {
+        [$live, $trashed] = rawDocuments([['title' => 'Live'], ['title' => 'Trashed', 'deleted_at' => '2026-01-01 00:00:00']]);
+
+        Auditor::delete(Document::withTrashed());
+
+        expect($this->audits()->pluck('subject_id')->all())->toBe([(string) $live, (string) $trashed])
+            ->and($this->audits()->pluck('event')->unique()->all())->toBe(['deleted']);
     });
 
     it('works on a soft-deleting model that does not use Auditable', function () {

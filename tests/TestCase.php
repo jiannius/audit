@@ -26,6 +26,7 @@ use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\HiddenPinDocument;
 use Jiannius\Audit\Tests\Fixtures\Invoice;
 use Jiannius\Audit\Tests\Fixtures\InvoiceLine;
+use Jiannius\Audit\Tests\Fixtures\LockedDocument;
 use Jiannius\Audit\Tests\Fixtures\LoggedDocument;
 use Jiannius\Audit\Tests\Fixtures\Order;
 use Jiannius\Audit\Tests\Fixtures\RecordActorJob;
@@ -63,6 +64,7 @@ abstract class TestCase extends Orchestra
             'stamped' => StampedRecord::class,
             'logged-document' => LoggedDocument::class,
             'unwrapped-document' => UnwrappedDocument::class,
+            'locked-document' => LockedDocument::class,
         ]);
 
         CurrentTeam::$id = null;
@@ -168,6 +170,7 @@ abstract class TestCase extends Orchestra
 
         Schema::create('invoices', function (Blueprint $table) {
             $table->ulid('id')->primary();
+            $table->unsignedBigInteger('user_id')->nullable();
             $table->text('number')->nullable();
             $table->timestamps();
         });
@@ -178,6 +181,13 @@ abstract class TestCase extends Orchestra
             $table->string('description')->nullable();
             $table->integer('quantity')->default(0);
             $table->timestamps();
+        });
+
+        // No primary key: the same team can be linked twice.
+        Schema::create('memberships', function (Blueprint $table) {
+            $table->unsignedBigInteger('user_id');
+            $table->unsignedBigInteger('team_id');
+            $table->string('role')->nullable();
         });
 
         Schema::create('team_user', function (Blueprint $table) {
