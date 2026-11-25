@@ -128,12 +128,12 @@ Every model that uses `Auditable` needs a morph-map alias ([section 2](#2-instal
 | `force_deleted` | the full raw snapshot | none | none |
 | `restored` | the changed keys (`deleted_at` before) | the changed keys (`deleted_at` after) | none |
 
-Any row whose old or new value was replaced by the truncation marker also has `meta.truncated`, the list of those fields ([section 9](#9-failure-behaviour)).
+Any row whose old or new value was replaced by the truncation marker also has `meta._truncated`, the list of those fields ([section 9](#9-failure-behaviour)). The leading underscore keeps it clear of your own meta keys; the package owns `_truncated`.
 
 - Values are **raw values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers, and PHP booleans are stored as `1` and `0`, as the database holds them. `old_values` come from the database. `new_values` are what the model holds after the save, as it was assigned, so a few casts differ in shape from what you would read back: a `decimal` column assigned a float stays a float (and one read from the database is a string), and an integer column assigned `'5'` stays `'5'`. Compare values by meaning, not by type.
 - A string value over `audit.max_value_bytes` is stored as the marker `"[truncated N bytes]"`, so a large attribute never blocks a save ([section 9](#9-failure-behaviour)).
 - `created` stores the attributes the model held when it was inserted. A column the database fills in by default is not in it.
-- `restore()` writes **one** `restored` row, not an extra `updated` one, and writes it inside the save, so it is as atomic as any other change.
+- `restore()` writes **one** `restored` row, not an extra `updated` one, and writes it inside the save, so it is as atomic as any other change. A model that was never trashed (built or created in memory, then restored) writes none. When the model was loaded without `deleted_at`, the row has no `old_values`, because what it was is unknown.
 - `forceDelete()` writes one `force_deleted` row. It is recorded when `auditEvents()` lists `deleted` or `force_deleted`.
 - `saveQuietly()`, `updateQuietly()` and `withoutEvents()` fire no model events, so they write no row. Use the helpers in [section 4](#4-writes-that-skip-events).
 - `increment()`, `decrement()` and `incrementEach()` fire `updated`, so they are recorded.
@@ -174,7 +174,7 @@ public function auditEvents(): array;             // ['created', 'updated', 'del
 
 - `password`, `api_key`, `*_api_key`, `secret_key`, `private_key` and `token` are stored as `"[redacted]"`, so the change is still visible. There is deliberately no broad `*_key` pattern: it would also hide `foreign_key` and `sort_key`.
 - `remember_token`, `*_token`, `*_secret` and `two_factor_recovery_codes` are excluded entirely: not stored, and a save that changes only those writes no row.
-- Attributes in the model's `$hidden` (`attributes.redact_hidden`) stay redacted whatever the instance does: the class's own `$hidden` always counts, so `makeVisible()` and `setHidden([])` do not un-redact them. `$visible` is a display whitelist, not a redaction source. Attributes cast `encrypted`, `encrypted:*`, `hashed` or `AsEncrypted*` (`attributes.redact_encrypted`) are redacted automatically too.
+- Attributes in the model's `$hidden` (`attributes.redact_hidden`) stay redacted whatever the instance does: what a fresh instance of the class hides always counts (the `$hidden` property, `#[Hidden]` and a `getHidden()` override), so `makeVisible()` and `setHidden([])` do not un-redact them. `$visible` is a display whitelist, not a redaction source. Attributes cast `encrypted`, `encrypted:*`, `hashed` or `AsEncrypted*` (`attributes.redact_encrypted`) are redacted automatically too.
 - A redacted attribute that is `null` stays `null`, so a row still shows that a value was set or cleared, never what it was.
 - Excluding wins over redacting.
 - **The record label follows the same rules.** `subject_label` skips any label attribute that is excluded, redacted, hidden or cast encrypted or hashed, so a label cannot leak what the values do not. If you override `auditLabel()`, keeping secrets out of it is yours to do.
@@ -207,7 +207,7 @@ public function save(array $options = [])
 }
 ```
 
-The same goes for an overridden `delete()`: alias it as `auditableDelete`. The `AuditCoverage::assertTransactional()` test helper (P5) flags models that override either without the alias ([section 12](#12-testing-your-app)).
+The same goes for an overridden `delete()`: alias it as `auditableDelete`. The `AuditCoverage::assertTransactional()` test helper flags models that override either without the alias ([section 12](#12-testing-your-app)).
 
 `increment()`, `decrement()` and `incrementEach()` are wrapped in the same transaction, so their row commits or rolls back with them. `incrementQuietly()` fires no events, so it writes no row.
 
@@ -482,7 +482,7 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 **Sanitising.** An awkward value must never block a legitimate save:
 
 - non-UTF-8 strings are stored as `"[binary N bytes]"`;
-- a string in `old_values`, `new_values` or `meta` over `audit.max_value_bytes` (default 65,536 bytes) is stored as the marker `"[truncated N bytes]"`, with its size and none of its content. A row whose old or new values hold such a marker also gets `meta.truncated`, the list of those fields, so an update whose old and new values read the same is explained. No hash of the content is stored;
+- a string in `old_values`, `new_values` or `meta` over `audit.max_value_bytes` (default 65,536 bytes) is stored as the marker `"[truncated N bytes]"`, with its size and none of its content. A row whose old or new values hold such a marker also gets `meta._truncated`, the list of those fields, so an update whose old and new values read the same is explained. No hash of the content is stored;
 - values that cannot be JSON-encoded (for example nesting beyond 512 levels) are stored as the marker `{"_audit": "[values could not be encoded]"}`, never as null;
 - NaN and infinite floats, resources and unknown objects are stored as short placeholders; enums store their backing value and dates their database string;
 - labels, source and identifiers are truncated to their column sizes, by character;
