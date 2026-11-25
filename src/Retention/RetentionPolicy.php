@@ -3,8 +3,8 @@
 namespace Jiannius\Audit\Retention;
 
 use Carbon\CarbonImmutable;
-use Carbon\CarbonInterval;
 use DateInterval;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use InvalidArgumentException;
 use Jiannius\Audit\Category;
 use Throwable;
@@ -19,6 +19,8 @@ final class RetentionPolicy
 
     public const OVERRIDE = 'override';
 
+    private const UNITS = 'second|minute|hour|day|week|month|year';
+
     /** @param  list<RetentionRule>  $rules  overrides in config order, then the category defaults */
     private function __construct(private readonly array $rules) {}
 
@@ -27,6 +29,13 @@ final class RetentionPolicy
     {
         $now ??= CarbonImmutable::now();
         $config = (array) config('audit.retention', []);
+
+        // A misspelt key (`override`, `recrod`) would quietly stop protecting or pruning the rows it meant.
+        $unknown = array_diff(array_keys($config), [...Category::all(), 'overrides']);
+
+        if ($unknown !== []) {
+            throw new InvalidArgumentException('audit.retention has unknown keys ['.implode(', ', $unknown).']. Use '.implode(', ', Category::all()).' and overrides.');
+        }
 
         $rules = [];
         $shadows = [];
@@ -104,11 +113,11 @@ final class RetentionPolicy
                 continue;
             }
 
-            if (! is_string($override[$column]) || $override[$column] === '') {
+            if (! is_string($override[$column]) || trim($override[$column]) === '') {
                 throw new InvalidArgumentException("audit.retention.overrides.{$index}.{$column} must be a non-empty string.");
             }
 
-            $criteria[$column] = $override[$column];
+            $criteria[$column] = trim($override[$column]);
         }
 
         if ($criteria === []) {
@@ -119,25 +128,52 @@ final class RetentionPolicy
             throw new InvalidArgumentException("audit.retention.overrides.{$index}.category must be one of: ".implode(', ', Category::all()).'.');
         }
 
+        // Rows store the morph alias, so a class name means its alias, as it does for `audit:purge --type`.
+        if (isset($criteria['subject_type'])) {
+            $criteria['subject_type'] = Relation::getMorphAlias($criteria['subject_type']);
+        }
+
         return [$criteria, $override['keep']];
     }
 
+    /**
+     * The moment before which rows may go: `$keep` counted back from now, which must lie in the past.
+     *
+     * $keep is `null` (keep forever), a sequence of `<positive number> <unit>` pairs such as `'7 years'` or
+     * `'1 year 6 months'` (second, minute, hour, day, week, month, year, singular or plural), or an ISO 8601
+     * duration such as `'P90D'`. Anything else, zero included, is refused: a period that reads as "now" or as
+     * a future date would delete a whole category.
+     */
     private static function cutoff(mixed $keep, CarbonImmutable $now, string $where): ?CarbonImmutable
     {
         if ($keep === null) {
             return null;
         }
 
+        $cutoff = null;
+
         try {
-            $interval = $keep instanceof DateInterval ? $keep : (is_string($keep) ? CarbonInterval::make($keep) : null);
+            if ($keep instanceof DateInterval) {
+                $cutoff = $keep->invert === 1 ? null : $now->sub($keep);
+            } elseif (is_string($keep) && preg_match('/\A\s*P(?=\d|T\d)/', $keep) === 1) {
+                $cutoff = $now->sub(new DateInterval(trim($keep)));
+            } elseif (is_string($keep) && preg_match('/\A\s*(?:[1-9]\d{0,5}\s*(?:'.self::UNITS.')s?\s*)+\z/i', $keep) === 1) {
+                $cutoff = $now;
+
+                preg_match_all('/([1-9]\d*)\s*('.self::UNITS.')/i', $keep, $pairs, PREG_SET_ORDER);
+
+                foreach ($pairs as [, $amount, $unit]) {
+                    $cutoff = $cutoff->sub(strtolower($unit), (int) $amount);
+                }
+            }
         } catch (Throwable) {
-            $interval = null;
+            $cutoff = null;
         }
 
-        if ($interval === null) {
-            throw new InvalidArgumentException("audit.retention.{$where} is not a period. Use a string such as '7 years' or '90 days', or null to keep forever.");
+        if ($cutoff === null || ! $cutoff->lessThan($now)) {
+            throw new InvalidArgumentException("audit.retention.{$where} is not a period that reaches back from now. Use a positive period such as '7 years', '90 days' or '1 year 6 months', an ISO 8601 duration such as 'P90D', or null to keep forever.");
         }
 
-        return $now->sub($interval);
+        return $cutoff;
     }
 }

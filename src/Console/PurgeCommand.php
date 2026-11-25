@@ -7,7 +7,6 @@ use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use InvalidArgumentException;
 use Jiannius\Audit\Category;
-use Jiannius\Audit\Facades\Auditor;
 use Jiannius\Audit\Retention\Pruner;
 use Jiannius\Audit\Retention\RetentionPolicy;
 use Throwable;
@@ -18,6 +17,8 @@ use Throwable;
  */
 class PurgeCommand extends Command
 {
+    use RecordsRun;
+
     protected $signature = 'audit:purge
         {--before= : Delete rows created before this date (required)}
         {--type= : Only rows about this record type (the morph alias)}
@@ -31,6 +32,10 @@ class PurgeCommand extends Command
 
     public function handle(Pruner $pruner): int
     {
+        if ($this->auditingIsOff()) {
+            return self::FAILURE;
+        }
+
         $filters = array_filter([
             'subject_type' => $this->option('type') !== null ? Relation::getMorphAlias((string) $this->option('type')) : null,
             'event' => $this->option('event'),
@@ -41,7 +46,10 @@ class PurgeCommand extends Command
             return $this->refuse($refusal);
         }
 
-        $before = CarbonImmutable::parse((string) $this->option('before'));
+        // In the application's timezone, the one rows are stored in: the check, the delete and the recorded
+        // date all use this one value. Left in the timezone it was typed in (`...+05:00`), the check would
+        // compare instants while the delete compared that timezone's wall clock.
+        $before = CarbonImmutable::parse((string) $this->option('before'))->setTimezone((string) config('app.timezone', 'UTC'));
         $pretend = (bool) $this->option('pretend');
         $force = (bool) $this->option('force');
         $belowRetention = (bool) $this->option('below-retention');
@@ -70,30 +78,39 @@ class PurgeCommand extends Command
             }
         }
 
-        $deleted = $pruner->delete(function ($query) use ($filters, $before) {
-            foreach ($filters as $column => $value) {
-                $query->where($column, $value);
-            }
+        $deleted = 0;
+        $failure = null;
 
-            return $query->where('created_at', '<', $before->format('Y-m-d H:i:s'));
-        }, $pretend);
+        try {
+            $pruner->delete(function ($query) use ($filters, $before) {
+                foreach ($filters as $column => $value) {
+                    $query->where($column, $value);
+                }
 
-        if ($pretend) {
-            $this->components->info("Pretending: {$deleted} audit rows would be deleted. Nothing was deleted or recorded.");
-
-            return self::SUCCESS;
+                return $query->where('created_at', '<', $before->format('Y-m-d H:i:s'));
+            }, $pretend, $deleted);
+        } catch (Throwable $e) {
+            $failure = $e;
         }
 
-        Auditor::record('audits_pruned', category: Category::ACTION, meta: [
-            'command' => 'purge',
-            'filters' => $filters,
-            'before' => $before->toIso8601String(),
-            'deleted' => $deleted,
-            'below_retention' => $belowRetention,
-            'forced' => $force,
-        ]);
+        if (! $pretend) {
+            $this->recordRun([
+                'command' => 'purge',
+                'filters' => $filters,
+                'before' => $before->toIso8601String(),
+                'deleted' => $deleted,
+                'below_retention' => $belowRetention,
+                'forced' => $force,
+            ], $failure);
+        }
 
-        $this->components->info("Deleted {$deleted} audit rows.");
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        $this->components->info($pretend
+            ? "Pretending: {$deleted} audit rows would be deleted. Nothing was deleted or recorded."
+            : "Deleted {$deleted} audit rows.");
 
         return self::SUCCESS;
     }

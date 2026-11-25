@@ -41,3 +41,15 @@ function rawDocuments(array $rows): array
 {
     return array_map(fn (array $row) => DB::table('documents')->insertGetId($row + ['title' => 'Doc', 'status' => 'draft', 'total' => 0]), $rows);
 }
+
+/** Insert one audit row, written the way the recorder would have, that many days ago. */
+function agedRow(string $category, string $event, ?string $type, int|float $daysOld, array $extra = []): int
+{
+    return DB::table('audits')->insertGetId($extra + [
+        'category' => $category,
+        'event' => $event,
+        'subject_type' => $type,
+        'subject_id' => $type === null ? null : '1',
+        'created_at' => now()->subDays($daysOld)->format('Y-m-d H:i:s'),
+    ]);
+}

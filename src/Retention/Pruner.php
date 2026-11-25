@@ -31,12 +31,14 @@ final class Pruner
      * Delete the rows the constraint selects, one chunk at a time, and return how many went.
      * With $pretend nothing is deleted and the count is what would be.
      *
+     * $deleted is the running total, so a caller that catches a failure still knows how many rows went.
+     *
      * @param  Closure(Builder): Builder  $constrain
      */
-    public function delete(Closure $constrain, bool $pretend = false): int
+    public function delete(Closure $constrain, bool $pretend = false, int &$deleted = 0): int
     {
         if ($pretend) {
-            return $constrain($this->table())->count();
+            return $deleted = $constrain($this->table())->count();
         }
 
         $chunk = max(1, (int) config('audit.prune.chunk', 1000));

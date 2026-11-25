@@ -16,7 +16,7 @@ it('keeps the other defaults when a published config is partial', function () {
         ->and(config('audit.attributes.exclude'))->toBe(['only_this'])
         ->and(config('audit.attributes.redact'))->toBe(['password', 'api_key', '*_api_key', 'secret_key', 'private_key', 'token'])
         ->and(config('audit.attributes.redact_hidden'))->toBeTrue()
-        ->and(config('audit.prune'))->toBe(['schedule' => null, 'chunk' => 1000])
+        ->and(config('audit.prune'))->toBe(['schedule' => null, 'chunk' => 1000, 'on_one_server' => false])
         ->and(config('audit.table'))->toBe('my_audits')
         ->and(config('audit.auth.identifier'))->toBe(['email', 'username'])
         ->and(config('audit.max_value_bytes'))->toBe(65536);

@@ -7,21 +7,10 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use Jiannius\Audit\Audit;
 use Jiannius\Audit\Exceptions\ImmutableAuditException;
 use Jiannius\Audit\Retention\RetentionPolicy;
-
-/** Insert one audit row, written the way the recorder would have, that many days ago. */
-function agedRow(string $category, string $event, ?string $type, int|float $daysOld, array $extra = []): int
-{
-    return DB::table('audits')->insertGetId($extra + [
-        'category' => $category,
-        'event' => $event,
-        'subject_type' => $type,
-        'subject_id' => $type === null ? null : '1',
-        'created_at' => now()->subDays($daysOld)->format('Y-m-d H:i:s'),
-    ]);
-}
 
 /** The ids still in the table, by the label they were given. */
 function keptIds(): array
@@ -356,14 +345,36 @@ describe('the schedule', function () {
         expect(pruneEvents())->toBe([]);
     });
 
-    it('refuses a schedule that is not a frequency method with no arguments or a cron expression', function (string $schedule) {
+    it('reports a schedule that is not a frequency method with no arguments or a cron expression, and registers nothing', function (string $schedule) {
+        Exceptions::fake();
         config(['audit.prune.schedule' => $schedule]);
 
-        expect(fn () => pruneEvents())->toThrow(InvalidArgumentException::class);
+        // The error must not stop the scheduler resolving: other tasks keep running.
+        expect(pruneEvents())->toBe([]);
+
+        Exceptions::assertReported(InvalidArgumentException::class);
     })->with([
         'a method that needs an argument' => 'dailyAt',
         'a method that is not a frequency' => 'run',
         'a word that is nothing' => 'nightly',
         'a broken cron' => '99 99 * * *',
     ]);
+
+    it('has audit:prune fail loudly on a schedule it cannot read, before deleting anything', function () {
+        config(['audit.prune.schedule' => 'nightly', 'audit.retention.record' => '1 year']);
+
+        agedRow('record', 'updated', 'invoice', 500);
+
+        $this->artisan('audit:prune')->expectsOutputToContain('audit.prune.schedule [nightly]')->assertFailed();
+
+        expect(DB::table('audits')->count())->toBe(1);
+    });
+
+    it('runs on one server only when asked, and not otherwise', function () {
+        expect(pruneEvents()[0]->onOneServer)->toBeFalse();
+
+        config(['audit.prune.on_one_server' => true]);
+
+        expect(pruneEvents()[0]->onOneServer)->toBeTrue();
+    });
 });

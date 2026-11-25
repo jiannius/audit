@@ -63,19 +63,23 @@ final class RetentionRule
     /**
      * Whether any row inside the filter could be a row this rule applies to. Errs towards yes.
      *
+     * Values are compared trimmed and without regard to case, because a case-insensitive collation (MySQL's
+     * default) matches `VOIDED` to `voided`, and a filter that "could not" match a rule it does would cut below it.
+     * Whether an earlier rule owns the filter's rows is the opposite risk, so that is compared exactly.
+     *
      * @param  array<string, string>  $filter  column => value, the columns the filter pins
      */
     public function couldMatch(array $filter): bool
     {
         foreach ($this->criteria as $column => $value) {
-            if (isset($filter[$column]) && $filter[$column] !== $value) {
+            if (isset($filter[$column]) && self::fold($filter[$column]) !== self::fold($value)) {
                 return false;
             }
         }
 
         // The rows both the filter and this rule pin down: an earlier rule that asks for no more than
         // that already owns every one of them.
-        $pinned = $filter + $this->criteria;
+        $pinned = array_map('trim', $filter) + $this->criteria;
 
         foreach ($this->shadows as $shadow) {
             if (array_diff_assoc($shadow, $pinned) === []) {
@@ -84,6 +88,11 @@ final class RetentionRule
         }
 
         return true;
+    }
+
+    private static function fold(string $value): string
+    {
+        return mb_strtolower(trim($value));
     }
 
     /** What the rule looks like in a summary row. */

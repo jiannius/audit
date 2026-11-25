@@ -666,10 +666,10 @@ Retention is your config, and the shipped defaults keep everything, so installin
 ],
 ```
 
-- `keep` and the category values are periods such as `'7 years'`, `'90 days'` or `'1 year 6 months'`, counted back from the moment the command runs. `null` keeps forever.
-- An override applies to the rows it matches; the first override in list order wins.
+- `keep` and the category values are **positive periods** counted back from the moment the command runs: one or more `<number> <unit>` pairs such as `'7 years'`, `'90 days'` or `'1 year 6 months'` (units: second, minute, hour, day, week, month, year, singular or plural), or an ISO 8601 duration such as `'P90D'`. `null` keeps forever. Anything else is refused, so a value that would reach "now" or the future (`'0 days'`, `'P0D'`, `'-5 days'`, `'yesterday'`, `'90 days ago'`, `'tomorrow'`) can never delete a whole category.
+- An override applies to the rows it matches; the first override in list order wins. Its `subject_type` is the morph alias, or a model class, which is read as its alias.
 - A category default applies only to rows in that category that no override matches. So an override can keep rows **longer** than their category as well as shorter, and an override with `keep: null` shields its rows from the category default.
-- A value the package cannot read is an error, not a guess: an unreadable period, an override without `keep`, an override with none of `subject_type`, `event` and `category`, and a misspelt key such as `evnt` (which would quietly make the override match more rows) all make `audit:prune` and `audit:purge` refuse to run and say which entry is wrong.
+- A value the package cannot read is an error, not a guess: an unreadable period, an override without `keep`, an override with none of `subject_type`, `event` and `category`, and a misspelt key such as `evnt` (which would quietly make the override match more rows) and a key of `retention` that is not `record`, `action`, `auth` or `overrides` (such as `override` or `recrod`) all make `audit:prune` and `audit:purge` refuse to run and say which entry is wrong.
 
 **`audit:prune`** is the only prune path and is scheduled for you. The package registers it with the scheduler, so you only need `php artisan schedule:run` in cron. The `Audit` model does not use `Prunable` or `MassPrunable`, so `model:prune` never touches audit rows.
 
@@ -680,9 +680,11 @@ Retention is your config, and the shipped defaults keep everything, so installin
 ],
 ```
 
-- The schedule is `daily`, `hourly`, `weekly` or any other frequency method that takes no arguments, or a cron expression such as `'15 3 * * *'`. Anything else, such as `dailyAt` (which needs a time) or a word that is not a method, is an error when the scheduler is built, so a typo cannot silently turn pruning off. `null` registers nothing; run `audit:prune` yourself. The task runs `withoutOverlapping()`.
+- The schedule is `daily`, `hourly`, `weekly` or any other frequency method that takes no arguments, or a cron expression such as `'15 3 * * *'`. `null` registers nothing; run `audit:prune` yourself. The task runs `withoutOverlapping()`.
+- **A schedule that cannot be read** (`dailyAt`, which needs a time, a word that is not a method, a broken cron) is reported through Laravel's exception handler and nothing is registered, so a typo in this one key does not take down `schedule:run` and every other task. `audit:prune` itself validates the value and fails loudly, so run it once after changing the config.
+- **Several servers.** `prune.on_one_server` (default `false`) adds `->onOneServer()`. A host that runs the scheduler on more than one server needs it, and a cache store that supports atomic locks shared by all of them (Redis, Memcached, database, DynamoDB), or every server prunes and writes its own row.
 - It deletes in chunks of `prune.chunk` rows with query-builder deletes, so the model's immutability guard and read scopes are never involved. A tenant read scope does not limit what it prunes.
-- **Every run writes one `audits_pruned` row**, even when nothing was deleted: category `action`, no subject. The daily row is your scheduler heartbeat: if it stops appearing, `schedule:run` is not running. The row is written after the deletes, outside any transaction, so a run that fails halfway leaves the rows it deleted deleted and writes no row.
+- **Every run writes one `audits_pruned` row**, even when nothing was deleted: category `action`, no subject. The daily row is your scheduler heartbeat: if it stops appearing, `schedule:run` is not running. The row is written after the deletes, outside any transaction. A run that fails part-way writes its row too, with the rules it reached, the rows it had deleted so far, `failed: true` and `exception` (the exception's class, never its message, which for a database error holds the SQL), and then the error goes on. The rows it deleted stay deleted, and the count is what the run had confirmed, which can be short by the chunk that was in flight.
 - `php artisan audit:prune --pretend` prints the counts per rule and writes nothing, not even the row.
 
 The row's `meta` lists every rule, overrides first in config order, then the three categories, each with its cutoff (ISO 8601; `null` when the rule keeps forever) and the number of rows it deleted:
@@ -706,9 +708,9 @@ The row's `meta` lists every rule, overrides first in config order, then the thr
 php artisan audit:purge --before=2026-01-01 --type=attachment --event=created [--category=record] [--pretend] [--force] [--below-retention]
 ```
 
-- `--before` is required, and so is at least one of `--type` (the morph alias; a model class works too), `--event` or `--category`. It deletes the rows created before that date (midnight, in the application's timezone) that match every filter you give.
+- `--before` is required, and so is at least one of `--type` (the morph alias; a model class works too), `--event` or `--category`. It deletes the rows created before that moment (a plain date is midnight) that match every filter you give. The date is converted to the application's timezone (`app.timezone`) as soon as it is read, and that one value is used for the retention check, the delete and the recorded `before`, so `--before=2026-01-01T00:00:00+05:00` means what it says.
 - **`--force`** only confirms a run outside the `local` environment. Without it, a non-local run refuses.
-- **`--below-retention`** is separate and always needed to cut below your configured retention. `--force` alone never allows it. The configured retention is the longest retention of any rule whose rows the filter could match; `null` means forever, so with the shipped defaults every purge needs `--below-retention`. If `--before` is later than the cutoff of that rule, the command refuses without it. A filter is only matched against the rules it could reach: `--category=auth` is judged by the `auth` rules alone, and `--type=attachment --event=created` by the override that names exactly that, while `--type=attachment` alone also reaches the category defaults.
+- **`--below-retention`** is separate and always needed to cut below your configured retention. `--force` alone never allows it. The configured retention is the longest retention of any rule whose rows the filter could match; `null` means forever, so with the shipped defaults every purge needs `--below-retention`. If `--before` is later than the cutoff of that rule, the command refuses without it. Filter values are compared without regard to case or surrounding spaces, as a case-insensitive database (MySQL's default) would, so `--event=VOIDED` is judged by the rule for `voided`. A filter is only matched against the rules it could reach: `--category=auth` is judged by the `auth` rules alone, and `--type=attachment --event=created` by the override that names exactly that, while `--type=attachment` alone also reaches the category defaults.
 - The refusals apply to `--pretend` too, so a dry run tells you what the real run will need.
 - `--pretend` deletes nothing and writes no row.
 - Otherwise it deletes in chunks and writes one `audits_pruned` row:
@@ -724,11 +726,11 @@ php artisan audit:purge --before=2026-01-01 --type=attachment --event=created [-
 }
 ```
 
-`filters` holds only the filters you gave, under the column names `subject_type`, `event` and `category`. `below_retention` and `forced` record whether those two flags were passed.
+A purge that fails part-way writes the same row with `failed` and `exception`, as a prune does. `filters` holds only the filters you gave, under the column names `subject_type`, `event` and `category`. `below_retention` and `forced` record whether those two flags were passed.
 
 **Indexes.** Category rules use `(category, created_at)`. Override rules use `(event, id)` or the subject index. A very large table with type-and-event overrides may want an extra `(subject_type, event, created_at)` index in your published migration.
 
-**Connections.** Both commands act on `audit.connection`, or the default connection when it is `null`. Run them once per tenant in a database-per-tenant setup ([section 8](#8-multi-tenant)), and on a privileged connection if you revoked `DELETE` from the application's database user ([section 14](#14-production-checklist)). While `audit.enabled` is `false` the commands still delete but write no summary row.
+**Connections.** Both commands act on `audit.connection`, or the default connection when it is `null`. Run them once per tenant in a database-per-tenant setup ([section 8](#8-multi-tenant)), and on a privileged connection if you revoked `DELETE` from the application's database user ([section 14](#14-production-checklist)). While `audit.enabled` is `false` both commands refuse to run (`--pretend` included) and exit non-zero, because they could not record what they deleted.
 
 ---
 
@@ -919,6 +921,7 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 | `retention.overrides` | `[]` | First match wins; each has `keep` and at least one of `subject_type`, `event`, `category` |
 | `prune.schedule` | `'daily'` | A frequency method or cron expression; `null` disables the schedule |
 | `prune.chunk` | `1000` | Rows per delete |
+| `prune.on_one_server` | `false` | Add `->onOneServer()` to the scheduled task. Needed when the scheduler runs on several servers; needs a shared cache that supports locks ([section 10](#10-retention-and-purge)) |
 | `formatter` | `Jiannius\Audit\Export\RawFormatter::class` | The `FormatsAuditValues` used by the CSV export |
 
 ---
