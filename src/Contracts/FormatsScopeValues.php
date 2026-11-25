@@ -13,13 +13,14 @@ namespace Jiannius\Audit\Contracts;
 interface FormatsScopeValues
 {
     /**
-     * Called before each batch of rows, once per scope column, with the batch's distinct non-null values.
+     * Called before each batch of rows, once per scope column, with the batch's distinct non-null values,
+     * which may be none.
      * It may do nothing, if `scopeValue()` needs no lookup.
      *
      * @param  list<mixed>  $raw
      */
     public function prepareScopeValues(string $column, array $raw): void;
 
-    /** 5 => 'Acme Ltd'. Called for every row, null included. A null result is a blank cell. */
+    /** 5 => 'Acme Ltd'. Called once per audit entry, null included. A null result is a blank cell. */
     public function scopeValue(string $column, mixed $raw): string|int|float|bool|null;
 }

@@ -773,7 +773,7 @@ interface FormatsAuditValues
 
 Set your implementation in `audit.formatter`, or rebind `FormatsAuditValues` in a service provider. The default `RawFormatter` uses headline field names (`placed_at` becomes `Placed At`), scalars as they are, arrays as JSON and `null` as blank.
 
-- `value()` receives the **raw** stored value: a scalar, `null`, or an array (a pivot field). A **JSON-cast column** arrives as the JSON text the database held (`'{"theme":"dark"}'`), a string, not an array, because values are recorded before casts ([section 3](#3-auditing-a-model)); `json_decode()` it if you want to show it differently. A field that only one side of the row has (a create has no old value) is passed as `null` for the other side, so guard it (`$raw === null ? null : $raw / 100`). A row without a subject, such as a sign-in, has an empty `$subjectType`.
+- `value()` receives the **raw** stored value: a scalar, `null`, or an array (a pivot field). A **JSON-cast column** arrives as JSON text (`'{"theme":"dark"}'`), a string, not an array, because values are recorded without casts ([section 3](#3-auditing-a-model)); `json_decode()` it if you want to show it differently. Its spacing and key order can differ by database. A field that only one side of the row has (a create has no old value) is passed as `null` for the other side, so guard it (`$raw === null ? null : $raw / 100`). A row without a subject, such as a sign-in, has an empty `$subjectType`.
 - A **pivot field** arrives in one of the two shapes [section 4](#pivot-changes) describes: a list of related ids, with an id linked twice repeated (`[1, 1, 2]`), or, for a relation declared with `withPivot()`, a map of id to its columns, or to a list of column sets when an id is linked twice (`{"1": {"role": "admin"}}`). `RawFormatter` writes both as JSON in one cell of the old and new columns; a formatter can turn them into something readable.
 - A returned `bool` is written as `true` or `false`, and `null` as a blank cell.
 
@@ -787,15 +787,15 @@ class AuditFormatter extends RawFormatter implements FormatsScopeValues
 {
     private array $names = [];
 
-    // Before each batch of rows, once per scope column, with the batch's distinct non-null values.
+    // Before each batch of rows, once per scope column, with the batch's distinct non-null values (possibly none).
     public function prepareScopeValues(string $column, array $raw): void
     {
-        if ($column === 'team_id') {
+        if ($column === 'team_id' && $raw !== []) {
             $this->names = Team::query()->whereIn('id', $raw)->pluck('name', 'id')->all();
         }
     }
 
-    // For every row, null included. A null result is a blank cell.
+    // Once per audit entry, null included. A null result is a blank cell.
     public function scopeValue(string $column, mixed $raw): string|int|float|bool|null
     {
         return $column === 'team_id' && $raw !== null ? ($this->names[$raw] ?? $raw) : $raw;
@@ -831,7 +831,7 @@ class AuditFormatter extends RawFormatter implements FormatsScopeValues
 - **Streams.** The rows are read through `chunkById(1000)`, in `id` order, and each batch is written before the next is read, so memory does not grow with the result. The query's own `orderBy()` is dropped (paging by id cannot honour it without skipping or repeating rows), so sort the file afterwards if you need another order. For the same reason a query with `limit()` or `offset()` throws `InvalidArgumentException` (`latest()->limit(100)` would export the hundred lowest ids): filter by a date or id range instead. The query must select every column (no partial `select()`).
 - Starts with a UTF-8 BOM, so Excel reads the encoding correctly. Cells are written with `fputcsv` and an empty escape character.
 - **CSV-injection safety:** a string cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`. This covers every text cell, including the record label, the user's name and what your formatter returns. Numbers (PHP `int` and `float`) are written as they are, and so is a string that is only a plain decimal number (`-150.00`, matching `-?\d+(\.\d+)?`), so a decimal column's value keeps its sign. Anything else that starts with one of those characters is prefixed: `-2+3`, `-1e5`, `+60123456789`, `=1`.
-- **Large exports: stream from a route.** Return `->download()` from a controller route and link to it, so the file streams to the browser. A Livewire action that returns a download base64-encodes the whole file in memory before it is sent, which defeats the streaming for a large export.
+- **Large exports: stream from a route.** Return `->download()` from a controller route and link to it, so the file streams to the browser. A handler that buffers the response, such as a Livewire action that returns a download, holds the whole file in memory (Livewire also base64-encodes it) before it is sent, which defeats the streaming for a large export.
 - An export is a sensitive file. You control who may run it.
 
 ---

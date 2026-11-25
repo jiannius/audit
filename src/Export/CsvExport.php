@@ -159,7 +159,7 @@ final class CsvExport
      * Write the BOM, the headings and every row to an open stream, for a command or a test.
      *
      * @param  resource  $handle
-     * @return int the number of data rows written, not counting the heading row
+     * @return int the number of CSV data rows written (one per field, so not the number of audit entries), not counting the heading row
      */
     public function write($handle): int
     {
