@@ -58,6 +58,9 @@ class Auditor
      * update, reads the same rows again by key, and compares the written columns. Expressions such as
      * DB::raw('total + 1') work, because the new value is read back rather than computed.
      *
+     * With a limit or an offset the write is narrowed to the keys the locked select returned (see QueryTarget::scopedTo()),
+     * so the rows written are always the rows audited.
+     *
      * A base query builder (DB::table()) needs $subjectType, a morph-map alias or a model class, unless
      * exactly one morph-map model uses its table. For an Eloquent builder or a relation the type comes
      * from the model, and $subjectType is ignored.
@@ -79,7 +82,12 @@ class Auditor
 
         return $target->connection()->transaction(function () use ($query, $target, $values, $columns, $event, $meta) {
             $before = $target->lockedRows();
-            $affected = $query->update($values);
+
+            // With a limit or an offset the database may pick other rows than the locked select did,
+            // so the write is narrowed to the locked keys: the written set is the audited set.
+            $affected = $target->limited()
+                ? $this->perChunk($before, $target, fn (array $keys) => $target->scopedTo($keys)->update($values))
+                : $query->update($values);
 
             $this->assertSameSet($before, $affected);
 
@@ -151,7 +159,11 @@ class Auditor
 
         return $target->connection()->transaction(function () use ($run, $target, $event, $meta, $force, $soft) {
             $before = $target->lockedRows();
-            $affected = $run();
+
+            // With a limit or an offset, delete exactly the locked keys: see update().
+            $affected = $target->limited()
+                ? $this->perChunk($before, $target, fn (array $keys) => $soft ? $target->scopedTo($keys)->delete() : $target->baseScopedTo($keys)->delete())
+                : $run();
 
             $this->assertSameSet($before, $affected);
 
@@ -368,6 +380,23 @@ class Auditor
         }
 
         return $relation->getRelated()->getTable();
+    }
+
+    /**
+     * Run a write for the locked keys, a chunk at a time (a limit can be large, and so can a bind list), and add up what it affected.
+     *
+     * @param  array<string, array<string, mixed>>  $locked
+     * @param  Closure(list<int|string>): int  $write
+     */
+    private function perChunk(array $locked, QueryTarget $target, Closure $write): int
+    {
+        $affected = 0;
+
+        foreach (array_chunk(array_column($locked, $target->keyName()), self::CHUNK) as $keys) {
+            $affected += $write($keys);
+        }
+
+        return $affected;
     }
 
     /**

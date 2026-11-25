@@ -526,3 +526,125 @@ describe('Auditor::update and delete through a has-many-through relation', funct
             ->and($this->audits()->pluck('subject_label')->all())->toBe(['Widget']);
     });
 });
+
+/** Six documents whose status order is not their id order, with an index on status the database may scan instead. */
+function limitFixture(): void
+{
+    Schema::table('documents', fn ($table) => $table->index('status'));
+
+    rawDocuments([
+        ['title' => 't-a', 'status' => 'f', 'total' => 1],
+        ['title' => 't-b', 'status' => 'c', 'total' => 1],
+        ['title' => 't-c', 'status' => 'b', 'total' => 1],
+        ['title' => 't-d', 'status' => 'c', 'total' => 1],
+        ['title' => 't-e', 'status' => 'b', 'total' => 1],
+        ['title' => 't-f', 'status' => 'e', 'total' => 1],
+    ]);
+}
+
+describe('Auditor::update and delete with a limit or an offset', function () {
+    it('audits exactly the rows it writes, for a limit with no order and an index the database could scan', function () {
+        limitFixture();
+
+        $count = Auditor::update(Document::query()->where('status', '>', 'a')->limit(2), ['total' => 7]);
+
+        $written = DB::table('documents')->where('total', 7)->orderBy('id')->pluck('id')->map(fn ($id) => (string) $id)->all();
+
+        expect($count)->toBe(2)
+            ->and($written)->toHaveCount(2)
+            ->and($this->audits()->pluck('subject_id')->all())->toBe($written)
+            ->and($this->audits()->pluck('new_values')->unique()->all())->toEqual([['total' => 7]]);
+    });
+
+    it('audits exactly the rows it writes, for an order with ties', function () {
+        limitFixture();
+
+        Auditor::update(Document::query()->orderBy('status')->limit(3), ['total' => 7]);
+
+        $written = DB::table('documents')->where('total', 7)->orderBy('id')->pluck('title')->all();
+
+        // The two `b` rows, then the first of the `c` rows by the primary key tie-break.
+        expect($written)->toBe(['t-b', 't-c', 't-e'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe($written);
+    });
+
+    it('audits exactly the rows it writes, for a limit and an offset', function () {
+        limitFixture();
+
+        Auditor::update(Document::query()->orderBy('title')->offset(1)->limit(2), ['total' => 7]);
+
+        expect(DB::table('documents')->where('total', 7)->orderBy('id')->pluck('title')->all())->toBe(['t-b', 't-c'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-b', 't-c']);
+    });
+
+    it('does the same on a base query builder', function () {
+        limitFixture();
+
+        Auditor::update(DB::table('documents')->orderBy('status')->orderBy('title', 'desc')->limit(2), ['total' => 7], subjectType: 'document');
+
+        expect(DB::table('documents')->where('total', 7)->orderBy('id')->pluck('title')->all())->toBe(['t-c', 't-e'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-c', 't-e']);
+    });
+
+    it('still touches updated_at and respects the model\'s scopes when it narrows the write', function () {
+        limitFixture();
+        DB::table('documents')->where('title', 't-c')->update(['deleted_at' => '2026-01-01 00:00:00']);
+
+        Auditor::update(Document::query()->orderBy('status')->limit(2), ['total' => 7]);
+
+        // The trashed t-c is out of reach, so the two `b` rows are t-e and then the first `c` row.
+        expect(DB::table('documents')->where('total', 7)->orderBy('id')->pluck('title')->all())->toBe(['t-b', 't-e'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-b', 't-e'])
+            ->and(DB::table('documents')->where('title', 't-b')->value('updated_at'))->not->toBeNull();
+    });
+
+    it('audits exactly the rows it soft deletes', function () {
+        limitFixture();
+
+        $count = Auditor::delete(Document::query()->where('status', '>', 'a')->limit(2));
+
+        $deleted = DB::table('documents')->whereNotNull('deleted_at')->orderBy('id')->pluck('id')->map(fn ($id) => (string) $id)->all();
+
+        expect($count)->toBe(2)
+            ->and($deleted)->toHaveCount(2)
+            ->and($this->audits()->pluck('subject_id')->all())->toBe($deleted)
+            ->and($this->audits()->pluck('meta')->unique()->all())->toEqual([['soft' => true]]);
+    });
+
+    it('audits exactly the rows it hard deletes, with an order that has ties and an offset', function () {
+        limitFixture();
+
+        Auditor::delete(Document::query()->orderBy('status')->offset(1)->limit(3), event: 'force_deleted');
+
+        // By status then id: t-c, t-e, t-b, t-d, t-f, t-a. Skip one, take three. A hard delete's rows follow that order.
+        expect(DB::table('documents')->orderBy('id')->pluck('title')->all())->toBe(['t-a', 't-c', 't-f'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-e', 't-b', 't-d']);
+    });
+
+    it('audits exactly the rows it hard deletes on a base query builder', function () {
+        limitFixture();
+
+        Auditor::delete(DB::table('documents')->orderBy('status')->limit(2), subjectType: 'document');
+
+        expect(DB::table('documents')->orderBy('id')->pluck('title')->all())->toBe(['t-a', 't-b', 't-d', 't-f'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-c', 't-e']);
+    });
+
+    it('handles a limit larger than one bind-list chunk', function () {
+        $rows = [];
+
+        foreach (range(1, 1500) as $i) {
+            $rows[] = ['title' => "Doc $i", 'status' => 'draft', 'total' => 0];
+        }
+
+        foreach (array_chunk($rows, 250) as $chunk) {
+            DB::table('documents')->insert($chunk);
+        }
+
+        $count = Auditor::update(Document::query()->orderBy('id')->limit(1200), ['total' => 1]);
+
+        expect($count)->toBe(1200)
+            ->and(DB::table('documents')->where('total', 1)->count())->toBe(1200)
+            ->and(DB::table('audits')->count())->toBe(1200);
+    });
+});

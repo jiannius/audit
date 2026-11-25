@@ -24,6 +24,7 @@ final class QueryTarget
         public readonly QueryBuilder $base,
         public readonly Model $model,
         public readonly bool $eloquent,
+        private readonly ?EloquentBuilder $builder = null,
     ) {}
 
     /**
@@ -40,7 +41,7 @@ final class QueryTarget
                 $query = (clone $query)->withoutGlobalScope(SoftDeletingScope::class);
             }
 
-            return new self($query->toBase(), $query->getModel(), true);
+            return new self($query->toBase(), $query->getModel(), true, $query);
         }
 
         return new self($query, self::modelFor($query, $subjectType), false);
@@ -60,6 +61,42 @@ final class QueryTarget
     public function table(): string
     {
         return self::fromParts($this->base)[0];
+    }
+
+    /** Whether the query has a limit or an offset, so the database and the locked select could pick different rows. */
+    public function limited(): bool
+    {
+        return $this->base->limit !== null || $this->base->offset !== null;
+    }
+
+    /**
+     * The query with its order, limit and offset taken off and narrowed to these keys, global scopes
+     * and all: a write that touches exactly the rows that were locked and audited.
+     *
+     * @param  list<int|string>  $keys
+     */
+    public function scopedTo(array $keys): EloquentBuilder|QueryBuilder
+    {
+        $query = $this->builder !== null ? clone $this->builder : clone $this->base;
+        $base = $query instanceof EloquentBuilder ? $query->getQuery() : $query;
+
+        $base->limit = null;
+        $base->offset = null;
+        $base->orders = null;
+
+        return $query->whereIn($this->alias().'.'.$this->keyName(), $keys);
+    }
+
+    /**
+     * The same as a base query: what a hard delete runs, whatever the model's delete() does.
+     *
+     * @param  list<int|string>  $keys
+     */
+    public function baseScopedTo(array $keys): QueryBuilder
+    {
+        $query = $this->scopedTo($keys);
+
+        return $query instanceof EloquentBuilder ? $query->toBase() : $query;
     }
 
     /** The name the query refers to its table by: the alias when it has one, else the table. */
@@ -120,7 +157,7 @@ final class QueryTarget
         $rows = [];
 
         foreach (array_chunk($keys, self::CHUNK) as $chunk) {
-            $rows += $this->keyed($this->base->newQuery()->from($this->base->from)->whereIn($this->keyName(), $chunk)->get());
+            $rows += $this->keyed($this->base->newQuery()->from($this->base->from)->whereIn($this->keyName(), $chunk)->orderBy($this->keyName())->get());
         }
 
         return $rows;

@@ -227,9 +227,10 @@ describe('Auditor::pivot field name', function () {
         [$one] = teams();
         $user = member();
 
-        Auditor::pivot($user->teams(), fn ($teams) => $teams->attach($one));
+        Auditor::pivot($user->roleTeams(), fn ($teams) => $teams->attach($one));
 
-        expect($this->audits()->first()->new_values)->toHaveKey('teams');
+        // The relation is roleTeams(); its table is team_user, and the related table is teams.
+        expect(array_keys($this->audits()->first()->new_values))->toBe(['roleTeams']);
     });
 
     it('falls back to the related table when the relation name is a backtrace guess', function () {
