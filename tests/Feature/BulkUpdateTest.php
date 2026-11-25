@@ -11,6 +11,7 @@ use Jiannius\Audit\Tests\Fixtures\AuditedInvoice;
 use Jiannius\Audit\Tests\Fixtures\AuditedLine;
 use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\Document;
+use Jiannius\Audit\Tests\Fixtures\LockedDocument;
 use Jiannius\Audit\Tests\Fixtures\Team;
 
 describe('Auditor::update', function () {
@@ -628,6 +629,51 @@ describe('Auditor::update and delete with a limit or an offset', function () {
 
         expect(DB::table('documents')->orderBy('id')->pluck('title')->all())->toBe(['t-a', 't-b', 't-d', 't-f'])
             ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-c', 't-e']);
+    });
+
+    it('keeps an OR in the query inside the key narrowing, for an update', function () {
+        limitFixture();
+
+        $count = Auditor::update(Document::query()->where('status', 'c')->orWhere('status', 'b')->orderBy('id')->limit(2), ['total' => 7]);
+
+        expect($count)->toBe(2)
+            ->and(DB::table('documents')->where('total', 7)->orderBy('id')->pluck('title')->all())->toBe(['t-b', 't-c'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-b', 't-c']);
+    });
+
+    it('keeps an OR in the query inside the key narrowing, for a soft delete', function () {
+        limitFixture();
+
+        $count = Auditor::delete(Document::query()->where('status', 'c')->orWhere('status', 'b')->orderBy('id')->limit(3));
+
+        expect($count)->toBe(3)
+            ->and(DB::table('documents')->whereNotNull('deleted_at')->orderBy('id')->pluck('title')->all())->toBe(['t-b', 't-c', 't-d'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-b', 't-c', 't-d']);
+    });
+
+    it('keeps an OR in the query inside the key narrowing, for a hard delete on a base builder', function () {
+        limitFixture();
+
+        $count = Auditor::delete(DB::table('documents')->where('status', 'c')->orWhere('status', 'b')->orderBy('id')->limit(2), subjectType: 'document');
+
+        expect($count)->toBe(2)
+            ->and(DB::table('documents')->orderBy('id')->pluck('title')->all())->toBe(['t-a', 't-d', 't-e', 't-f'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['t-b', 't-c']);
+    });
+
+    it('keeps a global scope applying around an OR, with a limit', function () {
+        rawDocuments([
+            ['title' => 'A', 'status' => 'draft'], ['title' => 'B', 'status' => 'locked'], ['title' => 'C', 'status' => 'draft'],
+            ['title' => 'D', 'status' => 'sent'], ['title' => 'E', 'status' => 'draft'], ['title' => 'F', 'status' => 'locked'],
+        ]);
+
+        // Without the scope this would take A, B, C: the locked B is out of reach, so it is A, C, E.
+        $count = Auditor::update(LockedDocument::query()->where('status', 'draft')->orWhere('status', 'locked')->orderBy('id')->limit(3), ['total' => 7]);
+
+        expect($count)->toBe(3)
+            ->and(DB::table('documents')->where('total', 7)->orderBy('id')->pluck('title')->all())->toBe(['A', 'C', 'E'])
+            ->and($this->audits()->pluck('subject_label')->all())->toBe(['A', 'C', 'E'])
+            ->and(DB::table('documents')->where('status', 'locked')->pluck('total')->unique()->all())->toBe([0]);
     });
 
     it('handles a limit larger than one bind-list chunk', function () {

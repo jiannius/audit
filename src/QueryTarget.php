@@ -84,6 +84,18 @@ final class QueryTarget
         $base->offset = null;
         $base->orders = null;
 
+        // The keys must narrow the whole of the original conditions: `a OR b` plus a key list
+        // would read `a OR (b AND key IN ...)`. Global scopes are applied later, around the group.
+        if ($base->wheres !== []) {
+            $nested = $base->forNestedWhere();
+            $nested->wheres = $base->wheres;
+            $nested->setBindings($base->getRawBindings()['where'], 'where');
+
+            $base->wheres = [];
+            $base->setBindings([], 'where');
+            $base->addNestedWhereQuery($nested);
+        }
+
         return $query->whereIn($this->alias().'.'.$this->keyName(), $keys);
     }
 
