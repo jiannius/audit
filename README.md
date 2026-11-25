@@ -2,7 +2,7 @@
 
 A small, generic audit trail for Laravel 13. It has no UI and no dependency beyond the Laravel framework itself.
 
-> **Status: v1 is being built in phases.** This README is the API spec, written first. Sections marked **Spec** describe behaviour that is not in the code yet; the phase that delivers it is named. Sections without the mark match the code.
+> **Status: v1.0.0.** The package was built in five phases, and every one of them is in the code.
 >
 > | Phase | Tag | Delivers | State |
 > |---|---|---|---|
@@ -10,7 +10,7 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 > | P2 | `alpha.2` | The `Auditable` trait | built |
 > | P3 | `alpha.3` | `Auditor::update`, `delete`, `pivot`, `updateQuietlyWithAudit`, `$model->audit()` | built |
 > | P4 | `alpha.4` | Sign-in listeners | built |
-> | P5 | `v1.0.0` | Retention, purge, CSV export, test helpers | spec |
+> | P5 | `v1.0.0` | Retention, purge, CSV export, test helpers | built |
 
 - [1. What it does and doesn't](#1-what-it-does-and-doesnt)
 - [2. Install](#2-install)
@@ -61,8 +61,6 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 composer require jiannius/audit
 php artisan vendor:publish --tag=audit-config --tag=audit-migrations
 ```
-
-While v1 is in its alpha tags, require a tag explicitly, for example `composer require jiannius/audit:^1.0@alpha`.
 
 Publish the migration **once**. While a `create_audits_table` migration exists in `database/migrations`, publishing again leaves it alone instead of adding a second copy.
 
@@ -291,7 +289,8 @@ Over two invoices, the last call writes these rows:
 - **The audited set is the written set.**
   - **With a `limit()` or `offset()`** the database and the locked select could pick different rows (a different index, ties in an `orderBy`). So the keys come from the locked select, which honours your `orderBy`, `limit` and `offset`, with the primary key as a tie-break after your order. The write then runs as the same query without its order, limit and offset, narrowed to exactly those keys (`whereIn`, in chunks of 1,000), with the model's scopes and `updated_at` handling as usual. A limit with no `orderBy` is allowed, but which rows it takes is up to the database, as it is without this package; the rows audited are always the rows written.
   - **Without a limit or offset** the original query is written as it is, and the locked select is ordered by primary key so two audited writes lock rows in the same order.
-  - If the write still affects more rows than were locked and snapshotted (a row that appeared in between under `READ COMMITTED`), it throws `RuntimeException` and rolls back: retry.
+  - **A global scope that itself sets `limit()`, `offset()` or `orderBy()` is not stripped** when a limited bulk query is narrowed to the locked keys. The scopes are applied when the narrowed write runs, so such a scope can make the write cover fewer rows than were locked, and the audit rows then disagree with what was written. Avoid scopes like that on a model you use with `Auditor::update` or `Auditor::delete`, or select the keys first and use `whereKey()`.
+- If the write still affects more rows than were locked and snapshotted (a row that appeared in between under `READ COMMITTED`), it throws `RuntimeException` and rolls back: retry.
   - A `limit()` or `offset()` on a query with joins (a many-to-many or has-many-through relation) is refused up front with `InvalidArgumentException`, because the database ignores the limit on a joined write. Select the keys first and use `whereKey()`.
 
 **A base query builder** (`DB::table()`) has no model, so it needs one:
@@ -445,7 +444,7 @@ Listeners are registered for the events in `audit.auth.events`; an event that is
 - `Failed` records the first listed key present in the credentials, and its value. Nothing else is ever read from the credentials, because they carry the plaintext password: the password, a one-time code or any other key never reaches a row.
 - `Lockout` carries only the request, so it records the first listed key present in the request input (`$request->input()`). If none is present, `identifier_key` and `identifier` are `null`.
 - A key counts as present when its value is a string or a number. The value is trimmed and cut to 255 characters, and otherwise stored as typed.
-- A key that looks like a secret is never read, even when you list it: `*password*`, `*passwd*`, `*secret*`, `*token*`, `otp`, `code`, `*_code`, `pin`, and anything that matches `audit.attributes.redact` or `audit.attributes.exclude`. A misconfigured `['password']` records null identifier fields.
+- A key that looks like a secret is never read, even when you list it: `*password*`, `*passwd*`, `*secret*`, `*token*`, `otp`, `code`, `*_code`, `pin`, and anything that matches `audit.attributes.redact` or `audit.attributes.exclude`. A misconfigured `['password']` records null identifier fields. The same goes for a field that merely looks like one: a sign-in keyed by `employee_code`, `code` or `pin` is skipped as secret-looking and records null identifier fields. Name the field something else, for example `employee_id`, and list that.
 - **People type their password into the email or username box.** Whatever is in that field is stored as typed, so a failed login row can hold a password. The package cannot tell. Treat these rows as sensitive and use retention ([section 10](#10-retention-and-purge)) to keep `auth` rows only as long as you need them.
 
 A form that keeps its identifier somewhere other than the top-level request input, such as a Livewire form, must put it into the input before firing `Lockout`:
@@ -594,7 +593,7 @@ Resolvers are class names (so config stays cacheable) and are resolved from the 
 - **A row keeps the tenant it was written with.** If a record later moves to another tenant, its old rows stay where they were. Who may see moved history is your rule; the package never rewrites rows, because rows are immutable.
 - **Indexes** on scope columns are yours to add in the published migration, for example `index(['team_id', 'id'])`.
 
-**What "immutable" covers.** An `Audit` instance cannot be updated or deleted: `save()`, `update()` and `delete()` throw. These still reach the table, because they skip the model events or never go through an instance: `saveQuietly()`, `Model::withoutEvents()`, `Audit::create()` (rows are meant to be inserted by the package only), and mass `Audit::query()->update()` or `->delete()`. Keep them out of host code. The raw-write test guard ([section 12](#12-testing-your-app), P5) flags them, and database-level grants stop them for certain ([section 14](#14-production-checklist)).
+**What "immutable" covers.** An `Audit` instance cannot be updated or deleted: `save()`, `update()` and `delete()` throw. These still reach the table, because they skip the model events or never go through an instance: `saveQuietly()`, `Model::withoutEvents()`, `Audit::create()` (rows are meant to be inserted by the package only), and mass `Audit::query()->update()` or `->delete()`. Keep them out of host code. The raw-write test guard ([section 12](#12-testing-your-app)) flags them, and database-level grants stop them for certain ([section 14](#14-production-checklist)).
 
 **Connections.** With `audit.connection = null` (the default), rows are written on the **subject's** connection, but the `Audit` model **reads** on the default connection. That fits database-per-tenant hosts, where the default connection is switched to the tenant's. A host that uses several connections in other ways should set `audit.connection` explicitly, so writes and reads use the same one.
 
@@ -651,11 +650,10 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 
 ## 10. Retention and purge
 
-> **Spec: lands in P5.**
-
 Retention is your config, and the shipped defaults keep everything, so installing the package never deletes data.
 
 ```php
+// config/audit.php
 'retention' => [
     'record' => '7 years',    // null keeps forever
     'action' => null,
@@ -668,11 +666,12 @@ Retention is your config, and the shipped defaults keep everything, so installin
 ],
 ```
 
+- `keep` and the category values are periods such as `'7 years'`, `'90 days'` or `'1 year 6 months'`, counted back from the moment the command runs. `null` keeps forever.
 - An override applies to the rows it matches; the first override in list order wins.
-- A category default applies only to rows in that category that no override matches. So an override can keep rows **longer** than their category as well as shorter.
-- `keep: null` keeps forever.
+- A category default applies only to rows in that category that no override matches. So an override can keep rows **longer** than their category as well as shorter, and an override with `keep: null` shields its rows from the category default.
+- A value the package cannot read is an error, not a guess: an unreadable period, an override without `keep`, an override with none of `subject_type`, `event` and `category`, and a misspelt key such as `evnt` (which would quietly make the override match more rows) all make `audit:prune` and `audit:purge` refuse to run and say which entry is wrong.
 
-**`audit:prune`** is the only prune path and is scheduled for you. The package registers it with the scheduler, so you only need `php artisan schedule:run` in cron. The `Audit` model does not use `Prunable` or `MassPrunable`, and `model:prune` never touches audit rows.
+**`audit:prune`** is the only prune path and is scheduled for you. The package registers it with the scheduler, so you only need `php artisan schedule:run` in cron. The `Audit` model does not use `Prunable` or `MassPrunable`, so `model:prune` never touches audit rows.
 
 ```php
 'prune' => [
@@ -681,9 +680,25 @@ Retention is your config, and the shipped defaults keep everything, so installin
 ],
 ```
 
-- It deletes in chunks with query-builder deletes, so the model's immutability guard is never involved.
-- **Every run writes one `audits_pruned` row**, even when nothing was deleted: category `action`, event `audits_pruned`, meta `command: 'prune'` and each rule's `{category | override, cutoff, deleted}`. The daily row is your scheduler heartbeat: if it stops appearing, `schedule:run` is not running.
-- `php artisan audit:prune --pretend` prints the counts and writes nothing.
+- The schedule is `daily`, `hourly`, `weekly` or any other frequency method that takes no arguments, or a cron expression such as `'15 3 * * *'`. Anything else, such as `dailyAt` (which needs a time) or a word that is not a method, is an error when the scheduler is built, so a typo cannot silently turn pruning off. `null` registers nothing; run `audit:prune` yourself. The task runs `withoutOverlapping()`.
+- It deletes in chunks of `prune.chunk` rows with query-builder deletes, so the model's immutability guard and read scopes are never involved. A tenant read scope does not limit what it prunes.
+- **Every run writes one `audits_pruned` row**, even when nothing was deleted: category `action`, no subject. The daily row is your scheduler heartbeat: if it stops appearing, `schedule:run` is not running. The row is written after the deletes, outside any transaction, so a run that fails halfway leaves the rows it deleted deleted and writes no row.
+- `php artisan audit:prune --pretend` prints the counts per rule and writes nothing, not even the row.
+
+The row's `meta` lists every rule, overrides first in config order, then the three categories, each with its cutoff (ISO 8601; `null` when the rule keeps forever) and the number of rows it deleted:
+
+```json
+{
+  "command": "prune",
+  "rules": [
+    {"override": {"subject_type": "attachment", "event": "created", "keep": "90 days"}, "cutoff": "2026-08-27T12:00:00+00:00", "deleted": 41},
+    {"override": {"category": "auth", "event": "login_failed", "keep": "1 year"}, "cutoff": "2025-11-25T12:00:00+00:00", "deleted": 0},
+    {"category": "record", "cutoff": "2019-11-25T12:00:00+00:00", "deleted": 0},
+    {"category": "auth", "cutoff": "2024-11-25T12:00:00+00:00", "deleted": 12},
+    {"category": "action", "cutoff": null, "deleted": 0}
+  ]
+}
+```
 
 **`audit:purge`** is the targeted, manual clean-up:
 
@@ -691,24 +706,39 @@ Retention is your config, and the shipped defaults keep everything, so installin
 php artisan audit:purge --before=2026-01-01 --type=attachment --event=created [--category=record] [--pretend] [--force] [--below-retention]
 ```
 
-- `--before` is required, and so is at least one of `--type`, `--event` or `--category`.
+- `--before` is required, and so is at least one of `--type` (the morph alias; a model class works too), `--event` or `--category`. It deletes the rows created before that date (midnight, in the application's timezone) that match every filter you give.
 - **`--force`** only confirms a run outside the `local` environment. Without it, a non-local run refuses.
-- **`--below-retention`** is separate and always needed to cut below your configured retention. `--force` alone never allows it. The configured retention is the longest retention of any rule whose rows the filter could match (`null` means forever); if `--before` is later than that cutoff, the command refuses without `--below-retention`.
+- **`--below-retention`** is separate and always needed to cut below your configured retention. `--force` alone never allows it. The configured retention is the longest retention of any rule whose rows the filter could match; `null` means forever, so with the shipped defaults every purge needs `--below-retention`. If `--before` is later than the cutoff of that rule, the command refuses without it. A filter is only matched against the rules it could reach: `--category=auth` is judged by the `auth` rules alone, and `--type=attachment --event=created` by the override that names exactly that, while `--type=attachment` alone also reaches the category defaults.
+- The refusals apply to `--pretend` too, so a dry run tells you what the real run will need.
 - `--pretend` deletes nothing and writes no row.
-- Otherwise it deletes in chunks and writes one `audits_pruned` row: meta `command: 'purge'`, the filters, `before`, `deleted`, `below_retention` and `forced`.
+- Otherwise it deletes in chunks and writes one `audits_pruned` row:
+
+```json
+{
+  "command": "purge",
+  "filters": {"subject_type": "attachment", "event": "created"},
+  "before": "2026-01-01T00:00:00+00:00",
+  "deleted": 218,
+  "below_retention": false,
+  "forced": false
+}
+```
+
+`filters` holds only the filters you gave, under the column names `subject_type`, `event` and `category`. `below_retention` and `forced` record whether those two flags were passed.
 
 **Indexes.** Category rules use `(category, created_at)`. Override rules use `(event, id)` or the subject index. A very large table with type-and-event overrides may want an extra `(subject_type, event, created_at)` index in your published migration.
+
+**Connections.** Both commands act on `audit.connection`, or the default connection when it is `null`. Run them once per tenant in a database-per-tenant setup ([section 8](#8-multi-tenant)), and on a privileged connection if you revoked `DELETE` from the application's database user ([section 14](#14-production-checklist)). While `audit.enabled` is `false` the commands still delete but write no summary row.
 
 ---
 
 ## 11. CSV export
 
-> **Spec: lands in P5.**
-
 A streamed, CSV-injection-safe export builder. You supply the query, so your own filters and visibility rules apply, and a formatter that turns raw values into display values.
 
 ```php
 use Jiannius\Audit\Audit;
+use Jiannius\Audit\Contracts\FormatsAuditValues;
 use Jiannius\Audit\Export\CsvExport;
 
 CsvExport::make(Audit::query()->between($from, $to))
@@ -719,6 +749,16 @@ CsvExport::make(Audit::query()->between($from, $to))
     ->download('audit-trail-2026-11.csv');         // StreamedResponse; ->write($handle): int for commands and tests
 ```
 
+| Method | |
+|---|---|
+| `CsvExport::make(Builder\|Relation $query)` | The rows to export: any Eloquent builder over the audits, with your own filters applied. A builder over a [read scope](#8-multi-tenant) stays inside it |
+| `->formatter(FormatsAuditValues $formatter)` | Default: `app(FormatsAuditValues::class)`, which the package binds to `audit.formatter` |
+| `->timezone(DateTimeZone\|string\|null $timezone)` | The timezone of the Time column. Default: the application's, which is what rows are stored in |
+| `->scopeColumns(array $columns)` | Your scope columns, written after Request ID: `['team_id' => 'Team']`, or `['team_id']` for a heading made from the column name |
+| `->headings(array $headings)` | Replace a heading, by the column's key (below). An unknown key throws, listing the valid ones |
+| `->download(string $filename, array $headers = [])` | A `StreamedResponse` for a controller: `text/csv; charset=UTF-8`, an attachment, `Cache-Control: no-store, private`. Slashes and control characters in the name are replaced |
+| `->write($handle): int` | Writes the BOM, the headings and every row to an open stream, and returns the number of data rows (not counting the heading row) |
+
 ```php
 interface FormatsAuditValues
 {
@@ -728,20 +768,43 @@ interface FormatsAuditValues
 }
 ```
 
-Set your implementation in `audit.formatter`. The default `RawFormatter` uses headline field names, scalars as they are, arrays as JSON and `null` as blank.
+Set your implementation in `audit.formatter`, or rebind `FormatsAuditValues` in a service provider. The default `RawFormatter` uses headline field names (`placed_at` becomes `Placed At`), scalars as they are, arrays as JSON and `null` as blank.
 
-- **One row per field.** An update gives one row per changed field; a create or delete one row per stored field; an event with no values one row with blank field columns. The Audit ID column regroups rows into entries.
-- **Columns:** Audit ID, Time (in the given timezone), Category, Event, Record type, Record ID, Record, Parent type, Parent ID, Field, Old value, New value, User ID, User name, User identifier, Source, IP address, User agent, Request ID, your scope columns, Details (meta as JSON).
-- Streams through `lazyById(1000)`, so it never loads the whole result.
-- Starts with a UTF-8 BOM, so Excel reads the encoding correctly.
-- **CSV-injection safety:** a string cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`. Have your formatter return numbers as numbers, so negative amounts are not prefixed.
+- `value()` receives the **raw** stored value: a scalar, `null`, or an array (a JSON column, or a pivot field). A field that only one side of the row has (a create has no old value) is passed as `null` for the other side, so guard it (`$raw === null ? null : $raw / 100`). A row without a subject, such as a sign-in, has an empty `$subjectType`.
+- A **pivot field** arrives in one of the two shapes [section 4](#pivot-changes) describes: a list of related ids, with an id linked twice repeated (`[1, 1, 2]`), or, for a relation declared with `withPivot()`, a map of id to its columns, or to a list of column sets when an id is linked twice (`{"1": {"role": "admin"}}`). `RawFormatter` writes both as JSON in one cell of the old and new columns; a formatter can turn them into something readable.
+- A returned `bool` is written as `true` or `false`, and `null` as a blank cell.
+
+**Rows: one per field.** An update gives one row per changed field; a create or delete one row per stored field; an event with no values, such as a sign-in or a `sent` event, one row with blank field columns. The Audit ID column regroups rows into entries. The order of fields within an entry is the order the database returns the JSON keys in, which is sorted on MySQL.
+
+**Columns**, with the key `headings()` takes:
+
+| Key | Heading | Content |
+|---|---|---|
+| `id` | Audit ID | |
+| `time` | Time | `created_at`, in the timezone you gave |
+| `category` | Category | |
+| `event` | Event | |
+| `record_type` | Record type | The subject type through `recordType()`; blank without a subject |
+| `record_id` | Record ID | |
+| `record` | Record | The `subject_label` snapshot |
+| `parent_type`, `parent_id` | Parent type, Parent ID | The parent type goes through `recordType()` too |
+| `field` | Field | Through `field()`; blank for an event with no values |
+| `old_value`, `new_value` | Old value, New value | Through `value()` |
+| `actor_id`, `actor_name`, `actor_identifier` | User ID, User name, User identifier | The snapshots |
+| `source`, `ip_address`, `user_agent`, `request_id` | Source, IP address, User agent, Request ID | |
+| your scope columns | the heading you gave | One per key of `scopeColumns()` |
+| `details` | Details | `meta` as JSON, repeated on every row of the entry. It holds `_truncated` when a value was replaced by `"[truncated N bytes]"` |
+
+- **Streams.** The rows are read through `lazyById(1000)`, in `id` order whatever order the query asked for, and written as they go, so memory does not grow with the result. The query must select every column (no partial `select()`).
+- Starts with a UTF-8 BOM, so Excel reads the encoding correctly. Cells are written with `fputcsv` and an empty escape character.
+- **CSV-injection safety:** a string cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`. This covers every text cell, including the record label, the user's name and what your formatter returns. Numbers (PHP `int` and `float`) are written as they are, so have your formatter return numbers as numbers: a negative amount returned as the string `'-150.50'` would be prefixed.
 - An export is a sensitive file. You control who may run it.
 
 ---
 
 ## 12. Testing your app
 
-> **Spec: lands in P5.** All three helpers are optional.
+All three helpers are optional. They need PHPUnit, which your test suite already has.
 
 ```php
 use Jiannius\Audit\Testing\AuditCoverage;
@@ -766,17 +829,53 @@ AuditCoverage::models(app_path('Models'), 'App\\Models')
     ->assertTransactional();    // flags Auditable models that override save() or delete()
 ```
 
-**How the guard works.** It tokenises your source with `token_get_all` (no extra dependency; Blade single-file components tokenise fine), splits it into statements and flags a statement that matches any of:
+**`InteractsWithAudits`** is a trait for your test case: `uses(InteractsWithAudits::class)->in('Feature')` in Pest, `use InteractsWithAudits;` in a PHPUnit class.
+
+```php
+public function assertAudited(Model $model, string $event, array $old = [], array $new = []): void;
+public function assertNotAudited(Model $model, string $event): void;
+```
+
+- They look at the rows whose subject is the model, across every tenant (a [read scope](#8-multi-tenant) is ignored).
+- `assertAudited` passes when some row of that event has all the `old` and `new` values you give. Only the keys you list are compared. Values are compared by meaning: `100` and `'100'` match, `true` matches the `1` the database holds, key order does not matter, and two different strings that look like numbers (`'007'` and `'7'`) do not. Arrays (a pivot field) must match whole.
+- A failure says what the model does have: no rows at all (a hint at `Event::fake()`), no row of that event (the events it does have), or the values that were found beside the ones you expected.
+
+**`RawWriteGuard`** reads your source with `token_get_all` (no extra dependency), splits it into statements and flags any statement that matches one of these. The statements inside a closure or a block are checked on their own.
 
 - `*Quietly(` and `withoutEvents(`;
-- `DB::(insert|update|delete|statement|unprepared|affectingStatement)(`;
+- `DB::(insert|update|delete|statement|unprepared|affectingStatement)(`, also after `DB::connection(...)->`;
 - `DB::table(...)` followed by a write (`insert*`, `update*`, `upsert`, `delete`, `truncate`, `increment*`, `decrement*`);
 - `->toBase()->(update|delete|insert)`;
+- a static mass write: `Model::insert(`, `insertOrIgnore(`, `insertGetId(`, `insertUsing(`, `upsert(` and `truncate(`;
 - pivot writes: `sync`, `syncWithoutDetaching`, `syncWithPivotValues`, `attach`, `detach`, `toggle`, `updateExistingPivot`;
 - a method chain ending in `update`, `delete`, `forceDelete`, `insert`, `insertOrIgnore`, `upsert`, `increment` or `decrement`;
-- any write through the `Audit` model.
+- any write through the `Audit` model (or your `audit.model` subclass).
 
-It skips statements that go through `Auditor::`. It is **biased towards false positives**: one allowlist line with a reason costs little. It cannot see dynamic calls such as `$query->{$method}()`, or a helper that hides a write.
+A statement is **not** flagged when it goes through `Auditor::update(`, `Auditor::delete(` or `Auditor::pivot(` (nor are the statements inside a closure you pass to one of them), through `updateQuietlyWithAudit(`, or through `->audit(`. Comments and the contents of strings never match. `Auditor::withSource()` and `Auditor::actingAs()` do not sanction what they wrap: a raw write inside them is still flagged.
+
+It reads Blade files too, including Livewire and Volt single-file components: the `<?php ... ?>` block is tokenised as it is, and the code in `@php` blocks, in directive arguments and in `{{ }}` and `{!! !!}` echoes is read out of the HTML. Blade comments and `@verbatim` blocks are skipped.
+
+**The allowlist.** Each entry is `['file', 'contains', 'reason']`: the file relative to the base path, text that appears in the statement as written (comments left out, whitespace collapsed to single spaces), and why the write needs no audit row. An entry without a reason is an error.
+
+```php
+// tests/Fixtures/audit/raw-writes.php
+return [
+    ['app/Console/Commands/PurgeDrafts.php', "Order::where('status', 'draft')->delete()", 'Drafts are scratch rows that no one ever sees.'],
+];
+```
+
+- A failure lists each write as `file:line`, the statement, and an allowlist line to paste in once you have decided it is deliberate.
+- An entry that matches no flagged statement (the write was fixed, moved or deleted) fails too, so the allowlist cannot rot.
+- A path that does not exist throws, because reading nothing would pass. `vendor`, `node_modules` and `storage` directories under a path are skipped.
+- It is **biased towards false positives**: one allowlist line with a reason costs little. It cannot see dynamic calls such as `$query->{$method}()`, a write that a helper hides, or a query built in a variable and written on a later line (`$query->update([...])` is not recognised, as `$order->update([...])` on a model is fine).
+- `writes()` returns every flagged statement and `check()` returns the violations and the stale entries, if you want to report them your own way.
+
+**`AuditCoverage`** finds your models by path: `app/Models/Billing/Invoice.php` is `App\Models\Billing\Invoice` (PSR-4). Abstract classes, traits and classes that are not Eloquent models are skipped.
+
+- `assertAllAuditable()` fails for every concrete model that does not use `Auditable` and is not in `except()`. An exception needs a reason, and an exception that names a model that is audited after all, or is not in the directory, fails as stale.
+- `assertMorphMapped()` fails for every audited model whose class is not a value of the morph map.
+- `assertTransactional()` fails for every audited model that declares its own `save()` or `delete()` without aliasing the trait's as `auditableSave` or `auditableDelete` ([section 3](#3-auditing-a-model)). A subclass that overrides `save()` and calls `parent::save()` of an audited parent is fine, and `updateQuietlyWithAudit()` brings its own transaction whatever the model overrides.
+- Each assertion reports every problem at once, and returns the instance so they chain.
 
 **In your own tests,** the package's behaviour is easy to assert on directly:
 
@@ -816,30 +915,34 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 | `scopes` | `[]` | Scope columns: `column => Resolver::class` or `column => ['resolver' => ..., 'read' => ...]` ([section 8](#8-multi-tenant)) |
 | `auth.events` | all seven sign-in events | Which sign-in events are recorded: `login`, `login_failed`, `lockout`, `logout`, `logout_current_device`, `logout_other_devices`, `password_reset`. Others are not listened for. A name that is not one of these is ignored |
 | `auth.identifier` | `['email', 'username']` | The first key present in the credentials (or, for a lockout, the request input) is recorded; nothing else is read ([section 6](#6-sign-ins)) |
-| `retention.record`, `.action`, `.auth` | `null` | Keep period such as `'7 years'`; `null` keeps forever (P5) |
-| `retention.overrides` | `[]` | First match wins; each has `keep` and at least one of `subject_type`, `event`, `category` (P5) |
-| `prune.schedule` | `'daily'` | A frequency method or cron expression; `null` disables the schedule (P5) |
-| `prune.chunk` | `1000` | Rows per delete (P5) |
-| `formatter` | `Jiannius\Audit\Export\RawFormatter::class` | The `FormatsAuditValues` used by the CSV export (P5) |
+| `retention.record`, `.action`, `.auth` | `null` | Keep period such as `'7 years'`; `null` keeps forever |
+| `retention.overrides` | `[]` | First match wins; each has `keep` and at least one of `subject_type`, `event`, `category` |
+| `prune.schedule` | `'daily'` | A frequency method or cron expression; `null` disables the schedule |
+| `prune.chunk` | `1000` | Rows per delete |
+| `formatter` | `Jiannius\Audit\Export\RawFormatter::class` | The `FormatsAuditValues` used by the CSV export |
 
 ---
 
 ## 14. Production checklist
 
-- [ ] **`schedule:run` is in cron.** Otherwise retention never runs. The daily `audits_pruned` row is the heartbeat.
+- [ ] **`schedule:run` is in cron.** Otherwise retention never runs. The daily `audits_pruned` row is the heartbeat: alert on it going missing.
+- [ ] **Retention is set.** The defaults keep everything. Decide per category, and keep `auth` rows only as long as you need them ([section 6](#6-sign-ins)).
 - [ ] **Trusted proxies are configured.** Otherwise `ip_address` records your proxy.
 - [ ] **Queue workers are running** for any queued work that writes audited changes.
 - [ ] **`php artisan config:cache`** after any audit config or env change.
 - [ ] **The migration is deployed before, or with,** the code that adds `Auditable`. A missing table blocks saves.
-- [ ] **Database-per-tenant:** the migration is in the tenant migrations ([section 8](#8-multi-tenant)).
-- [ ] **A morph map is enforced** and every audited model and user model has an alias.
+- [ ] **Database-per-tenant:** the migration is in the tenant migrations, and `audit:prune` and `audit:purge` run once per tenant ([section 8](#8-multi-tenant)).
+- [ ] **A morph map is enforced** and every audited model and user model has an alias (`AuditCoverage::assertMorphMapped()` checks it).
+- [ ] **`zend.exception_ignore_args=On`**, as in `php.ini-production`, so stack traces sent to your error tracker do not carry audited values ([section 9](#9-failure-behaviour)).
+- [ ] **The CSV export is behind your own authorisation.** The package adds none.
+- [ ] **`RawWriteGuard` runs in CI,** so a new write that skips model events cannot slip in ([section 12](#12-testing-your-app)).
 - [ ] **Optional database-level immutability.** For the strongest guarantee, give the application's database user no `UPDATE` or `DELETE` on the `audits` table, and run `audit:prune` and `audit:purge` on a privileged connection. The model blocks updates and deletes through an instance; `saveQuietly()`, `withoutEvents()`, `Audit::create()` and mass `Audit::query()->update()` or `->delete()` get past it ([section 8](#8-multi-tenant)). Only the database can stop those, and a database client.
 
 ---
 
 ## 15. Upgrading from the pre-1.0 package
 
-v1 is a breaking rewrite: a new table, a new API and no upgrade path. The pre-1.0 package was a single trait that wrote into your own `App\Models\Audit`; v1 shares none of its code or schema.
+v1 is a breaking rewrite: a new table, a new API and no upgrade path. The pre-1.0 package was a single trait that wrote into your own `App\Models\Audit`; v1 shares none of its code or schema. Install it as a new package ([section 2](#2-install)), and decide what to do with the old table yourself: v1 never reads or migrates it.
 
 A project that needs the old code can pin the last pre-rewrite commit:
 

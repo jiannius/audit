@@ -43,16 +43,21 @@ return [
         'identifier' => ['email', 'username'],  // the first key present is recorded; nothing else is ever read
     ],
 
+    // How long rows are kept. Every default keeps forever: installing the package never deletes data.
     'retention' => [
-        'record' => null,
+        'record' => null,      // e.g. '7 years'
         'action' => null,
-        'auth' => null,
-        'overrides' => [],
+        'auth' => null,        // e.g. '2 years'
+        'overrides' => [
+            // First match wins; each needs at least one of subject_type, event, category, and a keep (null: forever).
+            // ['subject_type' => 'attachment', 'event' => 'created', 'keep' => '90 days'],
+            // ['category' => 'auth', 'event' => 'login_failed', 'keep' => '1 year'],
+        ],
     ],
 
     'prune' => [
-        'schedule' => 'daily',   // frequency method or cron expression; null: not scheduled
-        'chunk' => 1000,
+        'schedule' => 'daily',   // audit:prune: a frequency method with no arguments, or a cron expression; null: not scheduled
+        'chunk' => 1000,         // rows per delete
     ],
 
     'formatter' => RawFormatter::class,
