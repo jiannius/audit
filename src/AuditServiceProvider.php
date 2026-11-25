@@ -27,6 +27,7 @@ class AuditServiceProvider extends ServiceProvider
 
         $this->app->scoped(AuditContext::class);
         $this->app->singleton(Recorder::class);
+        $this->app->singleton(AuditObserver::class);
         $this->app->singleton(Auditor::class);
     }
 
