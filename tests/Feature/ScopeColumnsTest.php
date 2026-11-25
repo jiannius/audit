@@ -158,3 +158,29 @@ it('lets a row keep the tenant it was written with', function () {
     CurrentTeam::$id = 1;
     expect(Audit::query()->sole()->team_id)->toBe(1);
 });
+
+describe('read resolver values', function () {
+    it('only counts a non-empty string or an int; anything else fails closed', function (mixed $value) {
+        $this->useScopes(['team_id' => ['resolver' => TeamScope::class, 'read' => fn () => $value]]);
+        CurrentTeam::$id = 1;
+        Auditor::record('sent');
+
+        expect(Audit::query()->count())->toBe(0)
+            ->and(Audit::withoutGlobalScope('audit.scope.team_id')->count())->toBe(1);
+    })->with([
+        'true' => true,
+        'false' => false,
+        'float' => 1.0,
+        'empty string' => '',
+        'array' => [[1]],
+        'object' => new stdClass,
+    ]);
+
+    it('accepts an int and a numeric string', function (mixed $value) {
+        $this->useScopes(['team_id' => ['resolver' => TeamScope::class, 'read' => fn () => $value]]);
+        CurrentTeam::$id = 1;
+        Auditor::record('sent');
+
+        expect(Audit::query()->count())->toBe(1);
+    })->with([1, '1']);
+});

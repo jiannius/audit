@@ -6,8 +6,12 @@ use BackedEnum;
 use DateTimeInterface;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use Jiannius\Audit\Context\AuditContext;
+use Jiannius\Audit\Exceptions\AuditWriteFailed;
+use JsonException;
 use JsonSerializable;
 use Stringable;
 use UnitEnum;
@@ -19,10 +23,17 @@ use UnitEnum;
  */
 class Recorder
 {
+    /** MySQL TEXT holds 65,535 bytes. */
+    private const TEXT_BYTES = 65535;
+
     public function record(PendingAudit $audit): void
     {
         if (! config('audit.enabled', true)) {
             return;
+        }
+
+        if (! in_array($audit->category, Category::all(), true)) {
+            throw new InvalidArgumentException('Unknown audit category ['.$audit->category.']. Use one of: '.implode(', ', Category::all()).'.');
         }
 
         $context = app(AuditContext::class);
@@ -53,16 +64,22 @@ class Recorder
             'source' => $this->limit($context->source(), 191),
             'request_id' => $this->limit($context->requestId(), 64),
             'ip_address' => $this->limit($context->ipAddress(), 45),
-            'user_agent' => $this->limit($context->userAgent(), 65000),
+            'user_agent' => $this->limitBytes($context->userAgent(), self::TEXT_BYTES),
             'old_values' => $this->encode($audit->old),
             'new_values' => $this->encode($audit->new),
             'meta' => $this->encode($audit->meta),
             'created_at' => now()->format('Y-m-d H:i:s'),
         ];
 
-        $this->connectionFor($audit->subject)
-            ->table(config('audit.table', 'audits'))
-            ->insert($row);
+        $table = config('audit.table', 'audits');
+
+        try {
+            $this->connectionFor($audit->subject)->table($table)->insert($row);
+        } catch (QueryException $e) {
+            // The original message carries the SQL with every binding: values, emails, IPs.
+            // Throw a new exception that holds none of it, and do not chain the original.
+            throw AuditWriteFailed::from($e, $table);
+        }
     }
 
     /** The label snapshot: the model's own auditLabel() when it has one, else the first filled configured attribute. */
@@ -97,10 +114,12 @@ class Recorder
      */
     public function sanitise(mixed $value): mixed
     {
+        $cap = (int) config('audit.max_value_bytes', 65536);
+
         return match (true) {
             $value === null, is_bool($value), is_int($value) => $value,
             is_float($value) => is_finite($value) ? $value : (string) $value,
-            is_string($value) => mb_check_encoding($value, 'UTF-8') ? $value : '[binary '.strlen($value).' bytes]',
+            is_string($value) => $this->sanitiseString($value, $cap),
             is_array($value) => array_map(fn ($item) => $this->sanitise($item), $value),
             $value instanceof BackedEnum => $this->sanitise($value->value),
             $value instanceof UnitEnum => $value->name,
@@ -112,15 +131,30 @@ class Recorder
         };
     }
 
+    /** Valid UTF-8 only, and over the byte cap only a marker: the size is kept, the content is not. */
+    private function sanitiseString(string $value, int $cap): string
+    {
+        if (! mb_check_encoding($value, 'UTF-8')) {
+            return '[binary '.strlen($value).' bytes]';
+        }
+
+        return $cap > 0 && strlen($value) > $cap ? '[truncated '.strlen($value).' bytes]' : $value;
+    }
+
     private function limit(?string $value, int $length): ?string
     {
         if ($value === null) {
             return null;
         }
 
-        $value = $this->sanitise($value);
+        $value = $this->sanitiseString($value, 0);
 
         return mb_strlen($value) > $length ? mb_substr($value, 0, $length) : $value;
+    }
+
+    private function limitBytes(?string $value, int $bytes): ?string
+    {
+        return $value === null ? null : mb_strcut($this->sanitiseString($value, 0), 0, $bytes);
     }
 
     private function encode(array $values): ?string
@@ -129,10 +163,12 @@ class Recorder
             return null;
         }
 
-        return json_encode(
-            $this->sanitise($values),
-            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR,
-        ) ?: null;
+        try {
+            return json_encode($this->sanitise($values), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            // Never write null for values that existed, and never block the save: say what happened.
+            return json_encode(['_audit' => '[values could not be encoded]']);
+        }
     }
 
     private function typeOf(?Model $model): ?string
@@ -175,6 +211,6 @@ class Recorder
         $callable = is_callable($resolver) && ! is_string($resolver) ? $resolver : app($resolver);
         $value = $callable($audit);
 
-        return is_scalar($value) ? $value : null;
+        return (is_string($value) && $value !== '') || is_int($value) ? $value : null;
     }
 }
