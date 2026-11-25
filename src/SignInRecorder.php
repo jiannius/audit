@@ -13,6 +13,7 @@ use Illuminate\Auth\SessionGuard;
 use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Str;
 use Jiannius\Audit\Context\Actor;
 use Stringable;
 use Throwable;
@@ -40,6 +41,9 @@ class SignInRecorder
 
     /** The longest identifier kept, in characters. It matches the actor_identifier column. */
     private const IDENTIFIER_LENGTH = 255;
+
+    /** Identifier keys that are never read, besides the `attributes.redact` and `attributes.exclude` patterns. */
+    private const SECRET_KEYS = ['*password*', '*passwd*', '*secret*', '*token*', 'otp', '*_otp', 'code', '*_code', 'pin'];
 
     public function __construct(private readonly Recorder $recorder) {}
 
@@ -69,7 +73,7 @@ class SignInRecorder
     }
 
     /** Fails closed: a sign-in attempt that cannot be recorded fails. */
-    public function failed(Failed $event): void
+    public function failed(#[\SensitiveParameter] Failed $event): void
     {
         if (! $this->enabled()) {
             return;
@@ -84,7 +88,7 @@ class SignInRecorder
         ]);
     }
 
-    public function lockout(Lockout $event): void
+    public function lockout(#[\SensitiveParameter] Lockout $event): void
     {
         if (! $this->enabled()) {
             return;
@@ -153,15 +157,16 @@ class SignInRecorder
 
     /**
      * The first configured key present in the input, and its value as typed
-     * (trimmed, truncated). No other key is read.
+     * (trimmed, truncated). No other key is read, and a key that looks like a
+     * secret is never read even when it is listed.
      *
      * @param  array<array-key, mixed>  $input
      * @return array{0: ?string, 1: ?string}
      */
-    private function identifier(array $input): array
+    private function identifier(#[\SensitiveParameter] array $input): array
     {
         foreach ((array) config('audit.auth.identifier', []) as $key) {
-            if (! is_string($key) || ! array_key_exists($key, $input)) {
+            if (! is_string($key) || $this->looksSecret($key) || ! array_key_exists($key, $input)) {
                 continue;
             }
 
@@ -173,6 +178,18 @@ class SignInRecorder
         }
 
         return [null, null];
+    }
+
+    /** A misconfigured identifier list must not be able to store a password, a code or a token. */
+    private function looksSecret(string $key): bool
+    {
+        $patterns = array_merge(
+            self::SECRET_KEYS,
+            array_filter((array) config('audit.attributes.redact', []), 'is_string'),
+            array_filter((array) config('audit.attributes.exclude', []), 'is_string'),
+        );
+
+        return Str::is($patterns, $key, true);
     }
 
     /** Whether this login came from a remember cookie. Reads a flag: it never resolves the user. */
@@ -203,7 +220,10 @@ class SignInRecorder
             });
 
             $this->attempt(function () use ($guard) {
-                $guard->getSession()->forget([$guard->getName(), 'password_hash_'.$guard->getName()]);
+                // The keys SessionGuard::login() wrote: the login id under getName(), the password hash under the raw guard name.
+                (function () {
+                    $this->session->forget([$this->getName(), 'password_hash_'.$this->name]);
+                })->call($guard);
             });
 
             $this->attempt(fn () => $guard->getCookieJar()->unqueue($guard->getRecallerName()));

@@ -239,6 +239,44 @@ describe('the identifier list', function () {
             ->and($failed[1]->meta['identifier'])->toBe(str_repeat('é', 255));
     });
 
+    it('never reads a key that looks like a secret, even when it is listed', function () {
+        foreach (['password', 'new_password', 'api_token', 'otp', 'verification_code', 'client_secret', 'Password'] as $key) {
+            config(['audit.auth.identifier' => [$key]]);
+
+            event(new Failed('web', null, [$key => 'Hunter2-listed-secret']));
+            event(new Lockout(formRequest([$key => 'Hunter2-listed-secret'])));
+        }
+
+        $rows = Audit::query()->get();
+
+        expect($rows)->toHaveCount(14)
+            ->and($rows->every(fn ($row) => $row->meta['identifier_key'] === null && $row->meta['identifier'] === null))->toBeTrue()
+            ->and(everythingAudited())->not->toContain('Hunter2');
+    });
+
+    it('also skips the keys the redact and exclude config names, and tries the next key', function () {
+        config([
+            'audit.attributes.redact' => ['ssn'],
+            'audit.auth.identifier' => ['ssn', 'created_at', 'username'],
+        ]);
+
+        event(new Failed('web', null, ['ssn' => '123-45-6789', 'created_at' => 'x', 'username' => 'ada']));
+
+        expect(lastSignIn('login_failed')->meta)->toMatchArray(['identifier_key' => 'username', 'identifier' => 'ada'])
+            ->and(everythingAudited())->not->toContain('123-45-6789');
+    });
+
+    it('reads nothing from credentials that are not an array', function () {
+        event(new Failed('web', null, (object) ['email' => 'ada@example.test', 'password' => 'Hunter2-object-password']));
+        event(new Failed('web', null, null));
+
+        $rows = Audit::query()->get();
+
+        expect($rows)->toHaveCount(2)
+            ->and($rows->every(fn ($row) => $row->meta['identifier'] === null))->toBeTrue()
+            ->and(everythingAudited())->not->toContain('Hunter2');
+    });
+
     it('reads a lockout from the request input', function () {
         event(new Lockout(formRequest(['email' => ' ada@example.test ', 'password' => 'x'])));
         event(new Lockout(formRequest(['username' => 'ada', 'password' => 'x'])));
@@ -366,10 +404,21 @@ describe('sign-out', function () {
 describe('when the insert fails', function () {
     it('undoes a password login and rethrows the audit error', function () {
         makeUser();
-        breakSignInAudits();
 
         $guard = Auth::guard();
         $key = $guard->getName();
+
+        // Control: a login that is recorded leaves both keys behind, so the assertions below can fail.
+        Auth::attempt(['email' => 'ada@example.test', 'password' => 'secret-password'], true);
+
+        expect($guard->getSession()->has($key))->toBeTrue()
+            ->and($guard->getSession()->has('password_hash_web'))->toBeTrue()
+            ->and(Cookie::hasQueued($guard->getRecallerName()))->toBeTrue();
+
+        Auth::logout();
+        $guard->getSession()->flush();
+        Cookie::unqueue($guard->getRecallerName());
+        breakSignInAudits();
 
         expect(fn () => Auth::attempt(['email' => 'ada@example.test', 'password' => 'secret-password'], true))
             ->toThrow(AuditWriteFailed::class);
@@ -377,7 +426,8 @@ describe('when the insert fails', function () {
         expect($guard->hasUser())->toBeFalse()
             ->and(Auth::check())->toBeFalse()
             ->and($guard->getSession()->has($key))->toBeFalse()
-            ->and($guard->getSession()->has('password_hash_'.$key))->toBeFalse()
+            ->and($guard->getSession()->has('password_hash_web'))->toBeFalse()
+            ->and(collect(array_keys($guard->getSession()->all()))->filter(fn ($k) => str_contains($k, 'login_') || str_contains($k, 'password_hash')))->toBeEmpty()
             ->and(Cookie::hasQueued($guard->getRecallerName()))->toBeFalse();
     });
 
@@ -421,6 +471,29 @@ describe('when the insert fails', function () {
         expect($guard->hasUser())->toBeFalse()
             ->and($guard->getSession()->has($guard->getName()))->toBeFalse()
             ->and($guard->user())->toBeNull();
+    });
+
+    it('leaves the next request unauthenticated after a login that could not be recorded', function () {
+        makeUser();
+        $session = config('session.cookie');
+
+        // Control: with the table intact, the same session cookie signs the next request in.
+        $ok = $this->post('/login', ['email' => 'ada@example.test', 'password' => 'secret-password', 'remember' => '1'])->assertOk();
+        $this->startNewProcess();
+        $this->withCookie($session, $ok->getCookie($session)->getValue())->get('/whoami')->assertSeeText('1');
+
+        $this->startNewProcess();
+        $this->flushSession();
+        breakSignInAudits();
+
+        $failed = $this->post('/login', ['email' => 'ada@example.test', 'password' => 'secret-password', 'remember' => '1'])->assertStatus(500);
+
+        expect($failed->getCookie(recallerName()))->toBeNull();
+
+        $this->createAuditsTable();
+        $this->startNewProcess();
+
+        $this->withCookie($session, $failed->getCookie($session)->getValue())->get('/whoami')->assertOk()->assertSeeText('')->assertContent('');
     });
 
     it('fails the sign-in attempt for a failed login', function () {
@@ -640,5 +713,68 @@ describe('a real flow', function () {
             ->and($failed->subject_id)->toBe((string) $user->id)
             ->and(Audit::query()->where('event', 'login')->count())->toBe(1)
             ->and(Auth::guard()->hasUser())->toBeFalse();
+    });
+});
+
+describe('other ways to sign in', function () {
+    it('records login_failed with the user as subject, and no login, when attemptWhen rejects them', function () {
+        $user = makeUser();
+
+        $signedIn = Auth::attemptWhen(['email' => 'ada@example.test', 'password' => 'secret-password'], fn () => false);
+
+        expect($signedIn)->toBeFalse()
+            ->and($this->audits()->pluck('event')->all())->toBe(['login_failed'])
+            ->and(lastSignIn('login_failed')->subject_id)->toBe((string) $user->id)
+            ->and(lastSignIn('login_failed')->meta)->toMatchArray(['identifier_key' => 'email', 'identifier' => 'ada@example.test']);
+    });
+
+    it('records each guard under its own name', function () {
+        config(['auth.guards.admin' => ['driver' => 'session', 'provider' => 'users']]);
+        $user = makeUser();
+
+        Auth::guard('web')->attempt(['email' => 'ada@example.test', 'password' => 'secret-password']);
+        Auth::guard('admin')->attempt(['email' => 'ada@example.test', 'password' => 'secret-password'], true);
+        Auth::guard('admin')->attempt(['email' => 'ada@example.test', 'password' => 'wrong-password']);
+        Auth::guard('admin')->logout();
+
+        $audits = $this->audits();
+
+        expect($audits->pluck('event')->all())->toBe(['login', 'login', 'login_failed', 'logout'])
+            ->and($audits->pluck('meta.guard')->all())->toBe(['web', 'admin', 'admin', 'admin'])
+            ->and($audits[1]->meta['remember'])->toBeTrue()
+            ->and($audits[0]->meta['remember'])->toBeFalse()
+            ->and($audits[3]->subject_id)->toBe((string) $user->id);
+    });
+
+    it('undoes a login on the guard that fired it, and leaves the other alone', function () {
+        config(['auth.guards.admin' => ['driver' => 'session', 'provider' => 'users']]);
+        $user = makeUser();
+        Auth::guard('web')->setUser($user);
+        breakSignInAudits();
+
+        expect(fn () => Auth::guard('admin')->login($user))->toThrow(AuditWriteFailed::class);
+
+        expect(Auth::guard('admin')->hasUser())->toBeFalse()
+            ->and(Auth::guard('web')->hasUser())->toBeTrue();
+    });
+
+    it('writes no sign-in row for a stateless sign-in that succeeds', function () {
+        $user = makeUser();
+
+        expect(Auth::once(['email' => 'ada@example.test', 'password' => 'secret-password']))->toBeTrue()
+            ->and(Auth::onceUsingId($user->id))->not->toBeFalse();
+
+        Auth::setUser($user);
+        $this->actingAs($user);
+
+        expect($this->audits())->toHaveCount(0);
+    });
+
+    it('still records a failed stateless attempt', function () {
+        makeUser();
+
+        Auth::once(['email' => 'ada@example.test', 'password' => 'wrong-password']);
+
+        expect($this->audits()->pluck('event')->all())->toBe(['login_failed']);
     });
 });
