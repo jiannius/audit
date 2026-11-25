@@ -680,7 +680,7 @@ Retention is your config, and the shipped defaults keep everything, so installin
 ],
 ```
 
-- The schedule is `daily`, `hourly`, `weekly` or any other frequency method that takes no arguments, or a cron expression such as `'15 3 * * *'`. `null` registers nothing; run `audit:prune` yourself. The task runs `withoutOverlapping()`.
+- The schedule is `daily`, `hourly`, `weekly` or any other frequency method that takes no arguments, or a cron expression such as `'15 3 * * *'`. `null` (or `false`) registers nothing; run `audit:prune` yourself. The task runs `withoutOverlapping()`.
 - **A schedule that cannot be read** (`dailyAt`, which needs a time, a word that is not a method, a broken cron) is reported through Laravel's exception handler and nothing is registered, so a typo in this one key does not take down `schedule:run` and every other task. `audit:prune` itself validates the value and fails loudly, so run it once after changing the config.
 - **Several servers.** `prune.on_one_server` (default `false`) adds `->onOneServer()`. A host that runs the scheduler on more than one server needs it, and a cache store that supports atomic locks shared by all of them (Redis, Memcached, database, DynamoDB), or every server prunes and writes its own row.
 - It deletes in chunks of `prune.chunk` rows with query-builder deletes, so the model's immutability guard and read scopes are never involved. A tenant read scope does not limit what it prunes.
@@ -710,7 +710,7 @@ php artisan audit:purge --before=2026-01-01 --type=attachment --event=created [-
 
 - `--before` is required, and so is at least one of `--type` (the morph alias; a model class works too), `--event` or `--category`. It deletes the rows created before that moment (a plain date is midnight) that match every filter you give. The date is converted to the application's timezone (`app.timezone`) as soon as it is read, and that one value is used for the retention check, the delete and the recorded `before`, so `--before=2026-01-01T00:00:00+05:00` means what it says.
 - **`--force`** only confirms a run outside the `local` environment. Without it, a non-local run refuses.
-- **`--below-retention`** is separate and always needed to cut below your configured retention. `--force` alone never allows it. The configured retention is the longest retention of any rule whose rows the filter could match; `null` means forever, so with the shipped defaults every purge needs `--below-retention`. If `--before` is later than the cutoff of that rule, the command refuses without it. Filter values are compared without regard to case or surrounding spaces, as a case-insensitive database (MySQL's default) would, so `--event=VOIDED` is judged by the rule for `voided`. A filter is only matched against the rules it could reach: `--category=auth` is judged by the `auth` rules alone, and `--type=attachment --event=created` by the override that names exactly that, while `--type=attachment` alone also reaches the category defaults.
+- **`--below-retention`** is separate and always needed to cut below your configured retention. `--force` alone never allows it. The configured retention is the longest retention of any rule whose rows the filter could match; `null` means forever, so with the shipped defaults every purge needs `--below-retention`. If `--before` is later than the cutoff of that rule, the command refuses without it. Filter values are compared without regard to case or surrounding spaces, as a case-insensitive database (MySQL's default) would, so `--event=VOIDED` is judged by the rule for `voided`. Accents are not folded: on an accent-insensitive MySQL collation the database treats `é` and `e` alike but this check does not, so use the exact names in overrides and filters. A filter is only matched against the rules it could reach: `--category=auth` is judged by the `auth` rules alone, and `--type=attachment --event=created` by the override that names exactly that, while `--type=attachment` alone also reaches the category defaults.
 - The refusals apply to `--pretend` too, so a dry run tells you what the real run will need.
 - `--pretend` deletes nothing and writes no row.
 - Otherwise it deletes in chunks and writes one `audits_pruned` row:
@@ -730,7 +730,7 @@ A purge that fails part-way writes the same row with `failed` and `exception`, a
 
 **Indexes.** Category rules use `(category, created_at)`. Override rules use `(event, id)` or the subject index. A very large table with type-and-event overrides may want an extra `(subject_type, event, created_at)` index in your published migration.
 
-**Connections.** Both commands act on `audit.connection`, or the default connection when it is `null`. Run them once per tenant in a database-per-tenant setup ([section 8](#8-multi-tenant)), and on a privileged connection if you revoked `DELETE` from the application's database user ([section 14](#14-production-checklist)). While `audit.enabled` is `false` both commands refuse to run (`--pretend` included) and exit non-zero, because they could not record what they deleted.
+**Connections.** Both commands act on `audit.connection`, or the default connection when it is `null`. Run them once per tenant in a database-per-tenant setup ([section 8](#8-multi-tenant)), and on a privileged connection if you revoked `DELETE` from the application's database user ([section 14](#14-production-checklist)). While `audit.enabled` is `false` both commands refuse to run and exit non-zero, because they could not record what they deleted. `--pretend` is the exception: it deletes and writes nothing, so it still runs and tells you what a real run would do.
 
 ---
 
@@ -925,7 +925,7 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 | `auth.identifier` | `['email', 'username']` | The first key present in the credentials (or, for a lockout, the request input) is recorded; nothing else is read ([section 6](#6-sign-ins)) |
 | `retention.record`, `.action`, `.auth` | `null` | Keep period such as `'7 years'`; `null` keeps forever |
 | `retention.overrides` | `[]` | First match wins; each has `keep` and at least one of `subject_type`, `event`, `category` |
-| `prune.schedule` | `'daily'` | A frequency method or cron expression; `null` disables the schedule |
+| `prune.schedule` | `'daily'` | A frequency method or cron expression; `null` (or `false`) disables the schedule |
 | `prune.chunk` | `1000` | Rows per delete |
 | `prune.on_one_server` | `false` | Add `->onOneServer()` to the scheduled task. Needed when the scheduler runs on several servers; needs a shared cache that supports locks ([section 10](#10-retention-and-purge)) |
 | `formatter` | `Jiannius\Audit\Export\RawFormatter::class` | The `FormatsAuditValues` used by the CSV export |

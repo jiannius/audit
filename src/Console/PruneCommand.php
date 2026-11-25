@@ -24,7 +24,8 @@ class PruneCommand extends Command
 
     public function handle(Pruner $pruner): int
     {
-        if ($this->auditingIsOff()) {
+        // --pretend deletes and records nothing, so it needs no summary row and runs while auditing is off.
+        if (! $this->option('pretend') && $this->auditingIsOff()) {
             return self::FAILURE;
         }
 

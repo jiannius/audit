@@ -339,6 +339,14 @@ describe('the schedule', function () {
         expect(pruneEvents()[0]->expression)->toBe('15 3 * * 1');
     });
 
+    it('is not registered when the schedule is false either', function () {
+        config(['audit.prune.schedule' => false]);
+
+        expect(pruneEvents())->toBe([]);
+
+        $this->artisan('audit:prune')->assertSuccessful();
+    });
+
     it('is not registered when the schedule is null', function () {
         config(['audit.prune.schedule' => null]);
 

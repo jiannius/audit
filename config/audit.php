@@ -56,7 +56,7 @@ return [
     ],
 
     'prune' => [
-        'schedule' => 'daily',   // audit:prune: a frequency method with no arguments, or a cron expression; null: not scheduled
+        'schedule' => 'daily',   // audit:prune: a frequency method with no arguments, or a cron expression; null or false: not scheduled
         'chunk' => 1000,         // rows per delete
         'on_one_server' => false, // true: run the scheduled task on one server only (needs a shared cache; see the README)
     ],

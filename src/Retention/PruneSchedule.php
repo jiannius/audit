@@ -16,11 +16,11 @@ use ReflectionMethod;
 final class PruneSchedule
 {
     /**
-     * Throw unless the config value is null (not scheduled), a frequency method that takes no arguments, or a cron expression.
+     * Throw unless the config value is null (not scheduled), a frequency method that takes no arguments, or a cron expression. `false` means the same as `null`: not scheduled.
      */
     public static function validate(mixed $frequency): void
     {
-        if ($frequency === null) {
+        if ($frequency === null || $frequency === false) {
             return;
         }
 
@@ -52,7 +52,7 @@ final class PruneSchedule
 
         self::validate($frequency);
 
-        if ($frequency === null) {
+        if ($frequency === null || $frequency === false) {
             return;
         }
 

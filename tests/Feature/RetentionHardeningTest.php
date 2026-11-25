@@ -307,8 +307,18 @@ describe('with auditing turned off', function () {
         $id = DB::table('audits')->insertGetId(['category' => 'record', 'event' => 'updated', 'created_at' => '2020-01-01 00:00:00']);
 
         $this->artisan('audit:prune')->expectsOutputToContain('audit.enabled is false')->assertFailed();
-        $this->artisan('audit:prune', ['--pretend' => true])->assertFailed();
         $this->artisan('audit:purge', ['--before' => '2021-01-01', '--category' => 'record', '--below-retention' => true])->expectsOutputToContain('audit.enabled is false')->assertFailed();
+
+        expect(DB::table('audits')->pluck('id')->all())->toBe([$id]);
+    });
+
+    it('still lets --pretend run, since it deletes and writes nothing', function () {
+        config(['audit.enabled' => false, 'audit.retention' => ['record' => '30 days']]);
+
+        $id = DB::table('audits')->insertGetId(['category' => 'record', 'event' => 'updated', 'created_at' => '2020-01-01 00:00:00']);
+
+        $this->artisan('audit:prune', ['--pretend' => true])->expectsOutputToContain('1 audit rows would be deleted')->assertSuccessful();
+        $this->artisan('audit:purge', ['--before' => '2021-01-01', '--category' => 'record', '--below-retention' => true, '--pretend' => true])->expectsOutputToContain('1 audit rows would be deleted')->assertSuccessful();
 
         expect(DB::table('audits')->pluck('id')->all())->toBe([$id]);
     });
