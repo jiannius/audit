@@ -62,7 +62,7 @@ composer require jiannius/audit
 php artisan vendor:publish --tag=audit-config --tag=audit-migrations
 ```
 
-Publish the migration **once**. While a `create_audits_table` migration exists in `database/migrations`, publishing again leaves it alone instead of adding a second copy.
+Publish the migration **once**. While a v1 migration exists in `database/migrations`, publishing again leaves it alone instead of adding a second copy. The package recognises its own migration by the `// jiannius/audit v1` line at the top of the file, so keep that line in your copy (a copy published from an alpha tag does not have it: add the line). A `create_audits_table` migration without the line, such as the pre-1.0 package's, is never reused.
 
 The package registers no global alias. Import the facade where you use it: `use Jiannius\Audit\Facades\Auditor;`.
 
@@ -945,7 +945,13 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 
 ## 15. Upgrading from the pre-1.0 package
 
-v1 is a breaking rewrite: a new table, a new API and no upgrade path. The pre-1.0 package was a single trait that wrote into your own `App\Models\Audit`; v1 shares none of its code or schema. Install it as a new package ([section 2](#2-install)), and decide what to do with the old table yourself: v1 never reads or migrates it.
+v1 is a breaking rewrite: a new table, a new API and no upgrade path. The pre-1.0 package was a single trait that wrote into your own `App\Models\Audit`; v1 shares none of its code or schema. v1 never reads or migrates the old table, so decide what to do with its data yourself.
+
+**Before you install v1 on a project that has the old package, deal with three things it shares:**
+
+1. **The table has the same name.** The old table is called `audits` too, and so is v1's. Rename or drop the old table (and delete the old `create_audits_table` migration, or leave it behind a migration that renames the table first), or give v1 another name with `audit.table` before you run its migration. Otherwise `migrate` fails on the existing table or, worse, runs against the old schema.
+2. **Publish only after that.** `php artisan vendor:publish --tag=audit-migrations` does not treat a `create_audits_table` migration without the v1 marker as already published, so it adds the v1 migration as a new file next to the old one. Run it once the old table is out of the way, and check that `migrate` creates the v1 columns.
+3. **The old trait has the same name.** It was `Jiannius\Audit\Auditable` too. Models that `use` it now get the v1 trait, which works differently (raw values, the morph alias, a transaction around `save()`). Review every model that uses it, and give each a morph-map alias ([section 2](#2-install)).
 
 A project that needs the old code can pin the last pre-rewrite commit:
 

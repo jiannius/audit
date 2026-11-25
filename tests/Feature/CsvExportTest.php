@@ -9,6 +9,7 @@ use Jiannius\Audit\Export\RawFormatter;
 use Jiannius\Audit\Facades\Auditor;
 use Jiannius\Audit\Tests\Fixtures\AuditedUser;
 use Jiannius\Audit\Tests\Fixtures\CentsFormatter;
+use Jiannius\Audit\Tests\Fixtures\Document;
 use Jiannius\Audit\Tests\Fixtures\Team;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -220,7 +221,7 @@ describe('a query with its own order', function () {
         manyAudits(2200, subject: 7);
         manyAudits(300, subject: 8);
 
-        $document = new Jiannius\Audit\Tests\Fixtures\Document;
+        $document = new Document;
         $document->setRawAttributes(['id' => 7]);
         $document->exists = true;
 

@@ -48,12 +48,8 @@ class AuditServiceProvider extends ServiceProvider
             ], 'audit-config');
 
             // The host owns this migration: it adds its scope columns and controls every ALTER.
-            // Publish once: while a create_audits_table migration exists, publishing again leaves it alone.
-            $existing = glob(database_path('migrations/*_create_audits_table.php'));
-            $target = $existing[0] ?? database_path('migrations/'.date('Y_m_d_His').'_create_audits_table.php');
-
             $this->publishesMigrations([
-                __DIR__.'/../database/migrations/create_audits_table.php.stub' => $target,
+                __DIR__.'/../database/migrations/create_audits_table.php.stub' => static::publishedMigrationPath(database_path('migrations')),
             ], 'audit-migrations');
 
             $this->commands([PruneCommand::class, PurgeCommand::class]);
@@ -81,6 +77,25 @@ class AuditServiceProvider extends ServiceProvider
                 report($e);
             }
         });
+    }
+
+    /** The line the published v1 migration carries, so it can be told from any other `create_audits_table` migration. */
+    public const MIGRATION_MARKER = '// jiannius/audit v1';
+
+    /**
+     * Where `vendor:publish` puts the migration: the v1 migration the host already published, so publishing
+     * twice leaves it alone, or else a new file. A `create_audits_table` migration of the pre-1.0 package is not
+     * the v1 one and is never reused, or publishing would skip the v1 table.
+     */
+    public static function publishedMigrationPath(string $directory): string
+    {
+        foreach (glob(rtrim($directory, '/').'/*_create_audits_table.php') ?: [] as $file) {
+            if (str_contains((string) file_get_contents($file), self::MIGRATION_MARKER)) {
+                return $file;
+            }
+        }
+
+        return rtrim($directory, '/').'/'.date('Y_m_d_His').'_create_audits_table.php';
     }
 
     /** Carry the actor and request id into queued jobs through hidden Context. */

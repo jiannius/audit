@@ -89,3 +89,59 @@ it('ships config that keeps everything by default', function () {
         ->and(config('audit.prune.schedule'))->toBe('daily')
         ->and(config('audit.transactional_saves'))->toBeTrue();
 });
+
+describe('which migration publishing reuses', function () {
+    function migrationsDirectory(array $files): string
+    {
+        $directory = sys_get_temp_dir().'/audit-migrations-'.bin2hex(random_bytes(6));
+        mkdir($directory);
+
+        foreach ($files as $name => $contents) {
+            file_put_contents($directory.'/'.$name, $contents);
+        }
+
+        return $directory;
+    }
+
+    afterEach(function () {
+        foreach (glob(sys_get_temp_dir().'/audit-migrations-*') ?: [] as $directory) {
+            array_map('unlink', glob($directory.'/*'));
+            rmdir($directory);
+        }
+    });
+
+    it('carries the marker in the stub, so a published copy can be recognised', function () {
+        expect(file_get_contents(__DIR__.'/../../database/migrations/create_audits_table.php.stub'))->toContain(AuditServiceProvider::MIGRATION_MARKER);
+    });
+
+    it('proposes a new file when there is no migration', function () {
+        $path = AuditServiceProvider::publishedMigrationPath(migrationsDirectory([]));
+
+        expect($path)->toMatch('/\/\d{4}_\d{2}_\d{2}_\d{6}_create_audits_table\.php$/')->and(file_exists($path))->toBeFalse();
+    });
+
+    it('reuses the v1 migration the host already published, so publishing twice changes nothing', function () {
+        $directory = migrationsDirectory(['2026_01_01_000000_create_audits_table.php' => "<?php\n\n".AuditServiceProvider::MIGRATION_MARKER."\n"]);
+
+        expect(AuditServiceProvider::publishedMigrationPath($directory))->toBe($directory.'/2026_01_01_000000_create_audits_table.php');
+    });
+
+    it('does not reuse the migration of the pre-1.0 package, whose table has the same name', function () {
+        $directory = migrationsDirectory(['2020_01_01_000000_create_audits_table.php' => "<?php\n\nreturn new class extends Illuminate\\Database\\Migrations\\Migration {};\n"]);
+
+        $path = AuditServiceProvider::publishedMigrationPath($directory);
+
+        expect($path)->not->toBe($directory.'/2020_01_01_000000_create_audits_table.php')
+            ->and($path)->toEndWith('_create_audits_table.php')
+            ->and(dirname($path))->toBe($directory);
+    });
+
+    it('finds the v1 migration among others', function () {
+        $directory = migrationsDirectory([
+            '2020_01_01_000000_create_audits_table.php' => "<?php\n",
+            '2026_01_01_000000_create_audits_table.php' => "<?php\n".AuditServiceProvider::MIGRATION_MARKER."\n",
+        ]);
+
+        expect(AuditServiceProvider::publishedMigrationPath($directory))->toBe($directory.'/2026_01_01_000000_create_audits_table.php');
+    });
+});

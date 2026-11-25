@@ -1,5 +1,7 @@
 <?php
 
+// jiannius/audit v1: the package recognises this file by this line, so keep it in your published copy.
+
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
