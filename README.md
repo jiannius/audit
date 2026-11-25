@@ -4,13 +4,13 @@ A small, generic audit trail for Laravel 13. It has no UI and no dependency beyo
 
 > **Status: v1 is being built in phases.** This README is the API spec, written first. Sections marked **Spec** describe behaviour that is not in the code yet; the phase that delivers it is named. Sections without the mark match the code.
 >
-> | Phase | Tag | Delivers |
-> |---|---|---|
-> | P1 | `v1.0.0-alpha.1` | Table, `Audit` model, `Recorder`, actor, source and request id, queue propagation, scope columns, `Auditor::record`, `actingAs` and `withSource` |
-> | P2 | `alpha.2` | The `Auditable` trait |
-> | P3 | `alpha.3` | `Auditor::update`, `delete`, `pivot`, `updateQuietlyWithAudit`, `$model->audit()` |
-> | P4 | `alpha.4` | Sign-in listeners |
-> | P5 | `v1.0.0` | Retention, purge, CSV export, test helpers |
+> | Phase | Tag | Delivers | State |
+> |---|---|---|---|
+> | P1 | `v1.0.0-alpha.1` | Table, `Audit` model, `Recorder`, actor, source and request id, queue propagation, scope columns, `Auditor::record`, `actingAs` and `withSource` | built |
+> | P2 | `alpha.2` | The `Auditable` trait | built |
+> | P3 | `alpha.3` | `Auditor::update`, `delete`, `pivot`, `updateQuietlyWithAudit`, `$model->audit()` | built |
+> | P4 | `alpha.4` | Sign-in listeners | spec |
+> | P5 | `v1.0.0` | Retention, purge, CSV export, test helpers | spec |
 
 - [1. What it does and doesn't](#1-what-it-does-and-doesnt)
 - [2. Install](#2-install)
@@ -223,17 +223,71 @@ The same goes for an overridden `delete()`: alias it as `auditableDelete`. The `
 
 ## 4. Writes that skip events
 
-> **Spec: lands in P3.**
+Bulk updates, `DB::table()` writes, `updateQuietly()` and pivot changes fire no model events, so they would leave no trail. Use these instead. Each runs the change and its audit rows in **one transaction**, so a failed audit insert rolls the change back ([section 9](#9-failure-behaviour)).
 
-Bulk updates, `DB::table()` writes, `updateQuietly()` and pivot changes fire no model events, so they would leave no trail. Use these instead; each runs in its own transaction with its audit rows.
+| You would write | Write this instead | Rows |
+|---|---|---|
+| `Order::where(...)->update([...])` | `Auditor::update(Order::where(...), [...])` | one per record that changed |
+| `DB::table('invoices')->where(...)->update([...])` | `Auditor::update(DB::table('invoices')->where(...), [...], subjectType: 'invoice')` | one per record that changed |
+| `Order::where(...)->delete()` | `Auditor::delete(Order::where(...))` | one per record deleted |
+| `$invoice->updateQuietly([...])` | `$invoice->updateQuietlyWithAudit([...])` | one, or none if nothing changed |
+| `$user->teams()->sync($ids)` | `Auditor::pivot($user->teams(), fn ($teams) => $teams->sync($ids))` | one on the parent, or none if the links are unchanged |
+
+Call them as `Auditor::update(...)`, `Auditor::delete(...)` and `Auditor::pivot(...)` (the facade), so the raw-write test guard ([section 12](#12-testing-your-app)) can tell an audited write from a raw one.
+
+### Bulk update
 
 ```php
+use Illuminate\Support\Facades\DB;
 use Jiannius\Audit\Facades\Auditor;
 
-// Bulk or raw update: one row per changed record, from before/after snapshots.
-Auditor::update($order->lines(), ['status' => 'cancelled'], meta: ['cascade' => 'order_cancelled']);
+Auditor::update(
+    EloquentBuilder|Relation|QueryBuilder $query,
+    array $values,
+    string $event = 'updated',
+    array $meta = [],
+    ?string $subjectType = null,
+): int;   // the number of rows the update affected, as Laravel's update() returns
+```
 
-// Keep an existing raw table write as it is, but audited.
+Before and after:
+
+```php
+// Before: no row at all.
+Order::where('status', 'open')->update(['status' => 'cancelled']);
+
+// After: one row per order that changed, each with its own old and new status.
+Auditor::update(Order::where('status', 'open'), ['status' => 'cancelled'], event: 'cancelled', meta: ['reason' => 'season_end']);
+
+// A relation: cascade a status to an invoice's lines in one statement.
+Auditor::update($invoice->lines(), ['status' => 'cancelled'], meta: ['cascade' => 'invoice_cancelled']);
+
+// An expression works too: each row records its own result.
+Auditor::update(Invoice::where('team_id', $team->id), ['total' => DB::raw('total + 100')]);
+```
+
+Over two invoices, the last call writes these rows:
+
+| subject | `old_values` | `new_values` |
+|---|---|---|
+| Invoice INV-1 | `{"total": 500}` | `{"total": 600}` |
+| Invoice INV-2 | `{"total": 120}` | `{"total": 220}` |
+
+**How it works.** In one transaction on the query's connection it selects the matching rows (`select *`, with `lockForUpdate`), runs your update, reads the same rows again by key, and compares the columns you wrote. So:
+
+- **Expressions work** (`DB::raw`, arithmetic on a column): the new value is read back, not computed.
+- **Only changed records get a row.** A record the update left as it was, such as `status` set to what it already was, gets none. A call that changes nothing writes nothing.
+- **Only the columns you wrote** are in `old_values` and `new_values`. A JSON path (`'settings->theme'`) is recorded as the whole `settings` column, and a table-qualified name (`'invoices.total'`) as `total`.
+- **The model's rules apply.** Excluded attributes never appear (a call that changes only excluded columns writes no row) and redacted ones are stored as `"[redacted]"`. The label and parent come from the model's `auditLabel()` and `auditParent()`, which receive a model hydrated with every column, so they are safe under strict mode. The `updated_at` an Eloquent update adds is excluded as usual.
+- **The model's `auditEvents()` is respected for standard events.** `Auditor::update(...)` with the default `updated` writes no row for a model that records only `deleted`. A custom event name (`voided`, `cancelled`) is always recorded: you asked for it.
+- **Scopes apply.** An Eloquent builder or relation brings its global scopes, including soft deletes, so a trashed record is not updated or recorded.
+- **The primary key cannot be updated** through it: the rows could not be matched before and after. It throws `InvalidArgumentException`.
+- **Locks and memory.** The `lockForUpdate` select makes the call hold row locks until it commits, a little longer than a plain update. Keep very large updates in batches. The matching rows are read into memory once, and the re-read goes in chunks of 1,000 keys.
+
+**A base query builder** (`DB::table()`) has no model, so it needs one:
+
+```php
+// Keep an existing raw table write exactly as it is, but audited.
 Auditor::update(
     DB::table('invoices')->where('id', $invoice->id),
     ['voided_at' => now(), 'void_reason' => $reason],
@@ -241,24 +295,84 @@ Auditor::update(
     meta: ['reason' => $reason],
     subjectType: 'invoice',
 );
+```
 
-// Bulk delete: snapshots every row first.
-Auditor::delete(Invoice::query()->where('status', 'draft'));
+`subjectType` is a morph-map alias (`'invoice'`) or a model class. Leave it out and the model is inferred from the morph map by table name, when exactly one model uses the table. If none does, or several do, it throws `InvalidArgumentException` and asks for `subjectType`. That model supplies the rules, the label and the parent. For an Eloquent builder or relation, `subjectType` is ignored.
 
+### Bulk delete
+
+```php
+Auditor::delete(
+    EloquentBuilder|Relation|QueryBuilder $query,
+    string $event = 'deleted',
+    array $meta = [],
+    ?string $subjectType = null,
+): int;
+```
+
+```php
+// Before: rows vanish with no trail.
+Order::where('status', 'draft')->delete();
+
+// After: every row is snapshotted first, then deleted.
+Auditor::delete(Order::where('status', 'draft'));
+```
+
+Each row has `old_values` (the full raw snapshot, filtered and redacted by the model's rules), no `new_values`, and `meta.soft`, as the model's own `delete()` records:
+
+- On an **Eloquent builder or relation of a soft-deleting model** it **soft deletes**, as Laravel's builder does, and `meta.soft` is `true`. Trashed rows are not matched unless the builder says `withTrashed()`.
+- Otherwise (a model that does not soft delete, or a base query builder, which knows nothing about soft deletes) it hard deletes and `meta.soft` is `false`.
+- `event: 'force_deleted'` on a soft-deleting model deletes for good, trashed rows included, as `forceDelete()` does, and records `force_deleted` with no `soft` key.
+
+### `updateQuietlyWithAudit()`
+
+```php
 // Metadata written without firing the model's saving hooks.
-$invoice->updateQuietlyWithAudit(['external_id' => $externalId], event: 'synced');
+$invoice->updateQuietlyWithAudit(['external_id' => $externalId], event: 'synced', meta: ['system' => 'ledger']);
+// returns bool, like updateQuietly()
+```
 
-// Pivot writes: snapshots the pivot rows before and after.
+It fills the model, saves it without events, and records one row from `getPrevious()` and `getChanges()`, in one transaction (whatever `transactional_saves` says: no `saved` hook is involved). The row has the same old and new values as an `updated` row from the observer, with your `event` (default `updated`) and `meta`, category `record`. A call that changes nothing, or only excluded attributes, writes no row. If the insert fails the update rolls back and the model is left as a failed `save()` leaves it: your values assigned and dirty, the originals untouched, so a retry of `save()` works.
+
+### Pivot changes
+
+```php
+Auditor::pivot(BelongsToMany $relation, Closure $write, string $event = 'updated', array $meta = []): mixed;
+```
+
+```php
+// Before: a membership change leaves no trail.
+$user->teams()->sync($teamIds);
+
+// After: one row on the user, if the links changed.
 Auditor::pivot($user->teams(), fn (BelongsToMany $teams) => $teams->sync($teamIds));
 ```
 
-`$query` may be an Eloquent builder, a relation or a base query builder. A base builder needs `subjectType`, or the type is inferred from the morph map by table name. `Auditor::update` selects the affected rows with `lockForUpdate`, so large bulk updates hold locks a little longer.
+It reads the pivot rows before and after your closure, in one transaction, and returns what the closure returned. `attach`, `detach`, `sync`, `toggle`, `updateExistingPivot` or your own pivot queries all work. If the links are the same afterwards, **nothing is written**.
+
+The row is recorded **on the relation's parent** (the user above), and the field is named after the relation (`teams`). Its old and new value is the **whole set of links**, in one of two shapes:
+
+| The relation | The field's old and new value | Example |
+|---|---|---|
+| has no pivot columns | a list of the related ids, sorted | `{"teams": [1, 3]}` becomes `{"teams": [1, 2]}` |
+| declares pivot columns with `withPivot()` | a map of related id to its columns, sorted by id | `{"teams": {"1": {"role": "member"}}}` becomes `{"teams": {"1": {"role": "admin"}}}` |
+
+- **Timestamps** (`withTimestamps()`) are left out, so touching `updated_at` alone is not a change.
+- **Excluded** pivot columns (`*_token` and the like) are left out, and **redacted** ones read `"[redacted]"`. A change to a redacted column is still seen as a change.
+- The parent's `auditEvents()` is checked for the default `updated` event, and the row uses the parent's `auditLabel()` and `auditParent()`.
+- The pivot rows are read with `lockForUpdate`, so two concurrent changes to the same parent's links serialise.
+- The whole set is stored on both sides, so a relation with thousands of links gives large rows. For those, record the change as a custom event instead.
+
+### Rules for all of them
+
+- **Atomic.** If an audit insert fails, the change is rolled back and `AuditWriteFailed` is thrown. Inside your own transaction they run as a savepoint, so the change and its rows commit or roll back with yours.
+- **Turned off.** While `audit.enabled` is `false` they run the change and write no rows.
+- **The audit connection.** The transaction is on the query's connection. If you point `audit.connection` at another connection, a row cannot join it ([section 9](#9-failure-behaviour)).
+- **Actor and source** come from the context, like every other row ([section 7](#7-actor-source-and-queues)).
 
 ---
 
 ## 5. Custom events
-
-`Auditor::record()` ships in P1. `$model->audit()` ships in P3.
 
 ```php
 use Jiannius\Audit\Category;
@@ -276,13 +390,24 @@ Auditor::record(
 
 Auditor::record('exported', meta: ['rows' => 1200]);
 Auditor::record('sent', $invoice, meta: ['to' => $recipients]);
-
-$invoice->audit('sent', meta: ['to' => $recipients]);   // P3: same, on a model that uses Auditable
 ```
+
+On a model that uses `Auditable`, `audit()` does the same with the model as the subject and its own `auditParent()` as the parent:
+
+```php
+$invoice->audit(string $event, array $meta = [], array $old = [], array $new = []): void;
+
+$invoice->audit('sent', meta: ['to' => $recipients]);
+$user->audit('plan_changed', old: ['plan' => 'free'], new: ['plan' => 'pro']);
+```
+
+- The category is `action`. Old and new values are optional, for an event that has a before and after but is not a column change.
+- **`$model->audit()` applies the model's rules to `old` and `new`:** excluded attributes are dropped and redacted ones stored as `"[redacted]"`. `Auditor::record()` stores what you pass, so keep secrets out of it yourself.
+- `$model->audit('updated')` and the other standard event names follow the model's `auditEvents()`, like the helpers in [section 4](#4-writes-that-skip-events). Any other name is always recorded.
 
 Name events after the domain action (`sent`, `voided`, `approved`), not the mechanism. A sync that changes fields is one row, the field change with `event: 'synced'`, not a change row plus an event row.
 
-`record()` writes in the caller's transaction, if any. See [section 9](#9-failure-behaviour).
+`record()` and `audit()` write in the caller's transaction, if any. They throw if the insert fails; work you did earlier outside a transaction stands. See [section 9](#9-failure-behaviour).
 
 ---
 
