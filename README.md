@@ -1,12 +1,12 @@
 # jiannius/audit
 
-A small, generic audit trail for Laravel 13. It has no UI and depends only on `illuminate/*`.
+A small, generic audit trail for Laravel 13. It has no UI and no dependency beyond the Laravel framework itself.
 
 > **Status: v1 is being built in phases.** This README is the API spec, written first. Sections marked **Spec** describe behaviour that is not in the code yet; the phase that delivers it is named. Sections without the mark match the code.
 >
 > | Phase | Tag | Delivers |
 > |---|---|---|
-> | P1 | `v1.0.0-alpha.1` | Table, `Audit` model, `Recorder`, actor, source and request id, queue propagation, scope columns, `Auditor::record` |
+> | P1 | `v1.0.0-alpha.1` | Table, `Audit` model, `Recorder`, actor, source and request id, queue propagation, scope columns, `Auditor::record`, `actingAs` and `withSource` |
 > | P2 | `alpha.2` | The `Auditable` trait |
 > | P3 | `alpha.3` | `Auditor::update`, `delete`, `pivot`, `updateQuietlyWithAudit`, `$model->audit()` |
 > | P4 | `alpha.4` | Sign-in listeners |
@@ -63,6 +63,10 @@ php artisan vendor:publish --tag=audit-config --tag=audit-migrations
 ```
 
 While v1 is in its alpha tags, require a tag explicitly, for example `composer require jiannius/audit:^1.0@alpha`.
+
+Publish the migration **once**. While a `create_audits_table` migration exists in `database/migrations`, publishing again leaves it alone instead of adding a second copy.
+
+The package registers no global alias. Import the facade where you use it: `use Jiannius\Audit\Facades\Auditor;`.
 
 Then:
 
@@ -282,8 +286,8 @@ Every row records who acted, where from, and in which request.
 **Actor.** The first match wins:
 
 1. An `Auditor::actingAs($user, fn () => ...)` override. `actingAs(null, ...)` means nobody.
-2. The user already signed in on the default guard. The package calls `hasUser()`, never `user()`, so recording a row never triggers a remember-cookie login as a side effect.
-3. The origin carried into a queued job (below).
+2. Inside a queued job: the origin carried from the process that dispatched it (below), even when that origin is nobody. The guard is **not** consulted inside a job, because a long-running worker keeps its guards between jobs, so a job that signed someone in would otherwise leak that user into the next job. A job that really does act as someone else says so with `actingAs`.
+3. The user signed in on the default guard. If the guard has not resolved its user yet, but the session already holds its login id, that user is looked up from the id. The package never calls `Auth::user()` and never reads the remember-me cookie, so recording a row cannot trigger a remember-cookie login, a `Login` event or any other side effect. A user known only from a remember cookie is recorded as nobody until your own code resolves them.
 4. A fallback: the user whose id is in the Context key named by `audit.actor.context_key`.
 5. Nobody, shown as "System".
 
@@ -301,7 +305,9 @@ Every row records who acted, where from, and in which request.
 | `web` | an HTTP request |
 | `console:<command>` | an Artisan command, for example `console:app:import` |
 | `queue:<job>` | inside a queued job, whatever the driver |
-| `schedule:<task>` | a scheduled closure; name it with `->name('...')`. A scheduled command shows as `console:<command>`, a scheduled job as `queue:<job>` |
+| `schedule:<task>` | work that runs inside the scheduler process: a closure (name it with `->name('...')`) or a job that is not queued, named after its class. Never a command line |
+| `console:<command>` | a scheduled artisan command, which runs as its own process, so it shows as `console:<command>` |
+| `queue:<job>` | a scheduled job that is queued runs on a worker, so it shows as `queue:<job>` |
 | `backfill:<name>` | whatever you set with `withSource` |
 
 ```php
@@ -314,17 +320,21 @@ Auditor::actingAs($admin, fn () => $this->import($file));
 
 Both return the callback's result and restore the previous value even when it throws. An explicit `withSource` beats the automatic source.
 
-**Request id.** Taken from the Context key in `audit.request_id.context_key` when your app already sets one; otherwise a ULID per request, per console command and per job that has no origin. It travels into jobs, so a job's rows correlate with the request that dispatched it.
+**Request id.** Taken from the Context key in `audit.request_id.context_key` when your app already sets one; otherwise a ULID per request, per console command or scheduler run, and per job that carries no origin. It travels into jobs: the jobs a process dispatches share that process's request id, so a job's rows correlate with the request, command or scheduler run that dispatched it.
 
 **IP and user agent.** Recorded for HTTP only. The IP is `request()->ip()`, so it is correct only if you configure trusted proxies ([section 14](#14-production-checklist)).
 
-**Queued jobs.** On dispatch the package adds a hidden `audit.origin` entry to Laravel's Context: the actor's type, id, name and identifier, the request id, and where the work started. Hidden Context travels in the job payload and never reaches log entries. The worker restores it, so a job's rows show:
+**Queued jobs.** On dispatch the package adds a hidden `audit.origin` entry to Laravel's Context: the actor's type, id, name and identifier, and the request id. Hidden Context travels in the job payload and never reaches log entries. The worker restores it, so a job's rows show:
 
 - the user who triggered the job, although nobody is signed in on the worker, even if that user has since been deleted;
 - source `queue:<job display name>`;
 - the same request id as the request that dispatched it.
 
-A job dispatched from a job, and each job in a chain, passes the same origin on. Jobs from the scheduler or a console command record "System" and their own request id. It works on every queue driver, because it relies only on Context serialisation; `sync` included.
+A job dispatched from a job, and each job in a chain, passes the same origin on. A job dispatched from a console command or the scheduler carries that process's request id and the signed-in actor if there is one, which is usually nobody, shown as "System". It works on every queue driver, because it relies only on Context serialisation; `sync` included. A job pushed from outside Laravel carries no origin, so it gets its own request id and no actor.
+
+Dispatching never fails because of the audit. If the signed-in user cannot be snapshotted (for example their class is missing from an enforced morph map), the job is dispatched with no actor, while an audit write by that user still fails loudly.
+
+`actingAs` wraps the dispatch itself. `Job::dispatch()` returns a pending dispatch that only pushes when it is destroyed, which can be after your callback has returned. Inside `actingAs`, dispatch immediately: `Bus::dispatch(new Job)` or `dispatch_sync`.
 
 The origin holds the actor's name and identifier, so those appear in the jobs table payload for as long as the job sits there.
 
@@ -387,7 +397,9 @@ Resolvers are class names (so config stays cacheable) and are resolved from the 
 - **A row keeps the tenant it was written with.** If a record later moves to another tenant, its old rows stay where they were. Who may see moved history is your rule; the package never rewrites rows, because rows are immutable.
 - **Indexes** on scope columns are yours to add in the published migration, for example `index(['team_id', 'id'])`.
 
-A mass `Audit::query()->update()` is not blocked by the model; keep it out of host code. The raw-write guard flags it ([section 12](#12-testing-your-app)).
+**What "immutable" covers.** An `Audit` instance cannot be updated or deleted: `save()`, `update()` and `delete()` throw. These still reach the table, because they skip the model events or never go through an instance: `saveQuietly()`, `Model::withoutEvents()`, `Audit::create()` (rows are meant to be inserted by the package only), and mass `Audit::query()->update()` or `->delete()`. Keep them out of host code. The raw-write test guard ([section 12](#12-testing-your-app), P5) flags them, and database-level grants stop them for certain ([section 14](#14-production-checklist)).
+
+**Connections.** With `audit.connection = null` (the default), rows are written on the **subject's** connection, but the `Audit` model **reads** on the default connection. That fits database-per-tenant hosts, where the default connection is switched to the tenant's. A host that uses several connections in other ways should set `audit.connection` explicitly, so writes and reads use the same one.
 
 **One database per tenant**
 
@@ -422,14 +434,18 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 - An exception in a `saved` hook now rolls the save back when `transactional_saves` is on. Run your full suite when you adopt it; the config switch is the off ramp.
 - `Model::increment()` and `decrement()` do not call `save()`, so they are not wrapped.
 
+**What the exception holds.** A failed insert throws `Jiannius\Audit\Exceptions\AuditWriteFailed`. It carries the table name, the SQLSTATE and the driver's error code, and nothing else: the database exception's own message holds the full SQL with every bound value (labels, emails, IPs), so it is not chained as `previous`. It still propagates, so a surrounding transaction rolls back. An invalid category throws `InvalidArgumentException` before any insert.
+
 **Sanitising.** An awkward value must never block a legitimate save:
 
 - non-UTF-8 strings are stored as `"[binary N bytes]"`;
+- a string in `old_values`, `new_values` or `meta` over `audit.max_value_bytes` (default 65,536 bytes) is stored as the marker `"[truncated N bytes]"`, with its size and none of its content;
+- values that cannot be JSON-encoded (for example nesting beyond 512 levels) are stored as the marker `{"_audit": "[values could not be encoded]"}`, never as null;
 - NaN and infinite floats, resources and unknown objects are stored as short placeholders; enums store their backing value and dates their database string;
 - labels, source and identifiers are truncated to their column sizes, by character;
-- the user agent is stored as text.
+- the user agent is stored as text, truncated to MySQL's 65,535 bytes without splitting a character.
 
-**The package never logs audit values**, so your error tracker never receives them from the package.
+**The package never logs audit values**, and it never puts them in an exception message, so your error tracker never receives them from the package.
 
 **Id gaps.** An auto-increment `id` can skip numbers when a transaction rolls back after the row was inserted. A gap is not a deleted row.
 
@@ -580,13 +596,16 @@ Run your suite under `Model::shouldBeStrict()` with an enforced morph map: that 
 
 Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usually cached in production, so changes take effect only after `php artisan config:cache`.
 
+**Partial configs are fine.** The package merges its defaults under your published file recursively, so a published `actor`, `attributes`, `auth` or `prune` array that lists only some keys keeps the defaults for the rest. **Lists are replaced, not merged**: if you set `attributes.exclude` or `attributes.label`, you get exactly your list, not yours plus the defaults. An empty list disables the default.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `env('AUDIT_ENABLED', true)` | Off skips every write. Only while seeding or importing, never in production |
 | `table` | `'audits'` | The table name. Read by the migration, the model and the recorder |
-| `connection` | `null` | `null` writes on the subject's connection (and shares its transaction); a name forces one connection |
+| `connection` | `null` | `null` writes on the subject's connection (and shares its transaction) while the `Audit` model reads on the default connection, which fits database-per-tenant. A name forces one connection for both. Set it explicitly if you use several connections otherwise |
 | `transactional_saves` | `true` | Wrap `Auditable` `save()` and `delete()` in a transaction with their row. Off for hosts that cannot accept saved-hook rollbacks |
 | `model` | `Jiannius\Audit\Audit::class` | Your own subclass, for example to add scopes. Rows are always inserted by the `Recorder` |
+| `max_value_bytes` | `65536` | A string in old/new/meta over this many bytes is stored as `"[truncated N bytes]"`. `0` turns the cap off |
 | `attributes.exclude` | `created_at`, `updated_at`, `remember_token`, `*_token`, `*_secret`, `two_factor_recovery_codes` | Never stored, never count as a change. Glob patterns |
 | `attributes.redact` | `['password']` | Stored as `"[redacted]"` |
 | `attributes.redact_hidden` | `true` | Redact attributes in the model's `$hidden` |
@@ -616,7 +635,7 @@ Publish it with `php artisan vendor:publish --tag=audit-config`. Config is usual
 - [ ] **The migration is deployed before, or with,** the code that adds `Auditable`. A missing table blocks saves.
 - [ ] **Database-per-tenant:** the migration is in the tenant migrations ([section 8](#8-multi-tenant)).
 - [ ] **A morph map is enforced** and every audited model and user model has an alias.
-- [ ] **Optional database-level immutability.** For the strongest guarantee, give the application's database user no `UPDATE` or `DELETE` on the `audits` table, and run `audit:prune` and `audit:purge` on a privileged connection. The model blocks updates and deletes in code; only the database can stop a database client.
+- [ ] **Optional database-level immutability.** For the strongest guarantee, give the application's database user no `UPDATE` or `DELETE` on the `audits` table, and run `audit:prune` and `audit:purge` on a privileged connection. The model blocks updates and deletes through an instance; `saveQuietly()`, `withoutEvents()`, `Audit::create()` and mass `Audit::query()->update()` or `->delete()` get past it ([section 8](#8-multi-tenant)). Only the database can stop those, and a database client.
 
 ---
 

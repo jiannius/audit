@@ -11,6 +11,7 @@ concurrency:
 
 jobs:
   tests:
+    name: PHP 8.4 (SQLite, MySQL 8.4)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -40,6 +41,9 @@ jobs:
       - name: Install dependencies
         run: composer update --no-interaction --no-progress --prefer-dist
 
+      - name: Pint
+        run: vendor/bin/pint --test
+
       - name: Pest (SQLite)
         run: vendor/bin/pest
         env:
@@ -54,3 +58,25 @@ jobs:
           DB_DATABASE: audit_testing
           DB_USERNAME: root
           DB_PASSWORD: ''
+
+  lowest:
+    name: PHP 8.3, lowest dependencies (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_sqlite, tokenizer
+          coverage: none
+
+      - name: Install lowest dependencies
+        run: composer update --prefer-lowest --no-interaction --no-progress --prefer-dist
+
+      - name: Pest (SQLite)
+        run: vendor/bin/pest
+        env:
+          DB_CONNECTION: sqlite

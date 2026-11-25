@@ -2,6 +2,7 @@
 
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schema;
+use Jiannius\Audit\AuditServiceProvider;
 
 it('publishes the migration under the audit-migrations tag and runs it', function () {
     $before = glob(database_path('migrations/*_create_audits_table.php'));
@@ -27,6 +28,39 @@ it('publishes the migration under the audit-migrations tag and runs it', functio
     } finally {
         Schema::dropIfExists('audit_log');
         array_map('unlink', $published);
+    }
+});
+
+it('does not publish a second copy of the migration', function () {
+    $before = glob(database_path('migrations/*_create_audits_table.php'));
+
+    Artisan::call('vendor:publish', ['--tag' => 'audit-migrations']);
+    // A later artisan process boots the provider again and finds the published file.
+    (new AuditServiceProvider($this->app))->boot();
+    Artisan::call('vendor:publish', ['--tag' => 'audit-migrations']);
+
+    $published = array_values(array_diff(glob(database_path('migrations/*_create_audits_table.php')), $before));
+
+    try {
+        expect($published)->toHaveCount(1);
+    } finally {
+        array_map('unlink', $published);
+    }
+});
+
+it('names its indexes explicitly, so a long table name stays under 64 characters', function () {
+    $table = str_repeat('a', 56);
+    config(['audit.table' => $table]);
+
+    (include __DIR__.'/../../database/migrations/create_audits_table.php.stub')->up();
+
+    try {
+        $indexes = collect(Schema::getIndexes($table))->pluck('name');
+
+        expect($indexes)->toHaveCount(8) // primary plus the seven
+            ->and($indexes->every(fn ($name) => strlen($name) <= 64))->toBeTrue();
+    } finally {
+        Schema::dropIfExists($table);
     }
 });
 

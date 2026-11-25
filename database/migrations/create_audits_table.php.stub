@@ -13,7 +13,13 @@ return new class extends Migration
 
     public function up(): void
     {
-        Schema::connection($this->getConnection())->create(config('audit.table', 'audits'), function (Blueprint $table) {
+        $name = config('audit.table', 'audits');
+
+        // Short, explicit index names keep a long custom table name under MySQL's 64 characters.
+        // Index names are unique per database on SQLite and PostgreSQL, so they carry the table name.
+        $index = fn (string $suffix): string => substr($name, 0, 50).'_'.$suffix.'_idx';
+
+        Schema::connection($this->getConnection())->create($name, function (Blueprint $table) use ($index) {
             $table->id();                                      // bigint: compact, monotonic, cheap "order by id desc"
             $table->string('category', 16);                    // record | auth | action (retention group)
             $table->string('event', 64);                       // created, updated, deleted, restored, login, voided, sent ...
@@ -29,7 +35,7 @@ return new class extends Migration
 
             // Host scope columns, one per key in config('audit.scopes'). No foreign keys. For example:
             // $table->unsignedBigInteger('team_id')->nullable();
-            // $table->index(['team_id', 'id']);
+            // $table->index(['team_id', 'id'], $index('team'));
 
             $table->string('source', 191)->nullable();         // web | console:<cmd> | queue:<job> | schedule:<task> | backfill:<name>
             $table->string('request_id', 64)->nullable();
@@ -40,13 +46,13 @@ return new class extends Migration
             $table->json('meta')->nullable();
             $table->dateTime('created_at');                    // datetime, not timestamp: no 2038 ceiling for long retention
 
-            $table->index(['subject_type', 'subject_id', 'id']);
-            $table->index(['parent_type', 'parent_id', 'id']);
-            $table->index(['actor_type', 'actor_id', 'id']);
-            $table->index(['event', 'id']);
-            $table->index(['category', 'created_at']);         // retention + category filter
-            $table->index('created_at');                       // date-range filter and export
-            $table->index('request_id');
+            $table->index(['subject_type', 'subject_id', 'id'], $index('subject'));
+            $table->index(['parent_type', 'parent_id', 'id'], $index('parent'));
+            $table->index(['actor_type', 'actor_id', 'id'], $index('actor'));
+            $table->index(['event', 'id'], $index('event'));
+            $table->index(['category', 'created_at'], $index('category'));   // retention + category filter
+            $table->index('created_at', $index('created'));                  // date-range filter and export
+            $table->index('request_id', $index('request'));
         });
     }
 

@@ -20,6 +20,7 @@
         "illuminate/http": "^13.0",
         "illuminate/log": "^13.0",
         "illuminate/queue": "^13.0",
+        "illuminate/routing": "^13.0",
         "illuminate/support": "^13.0"
     },
     "require-dev": {
@@ -41,10 +42,7 @@
         "laravel": {
             "providers": [
                 "Jiannius\\Audit\\AuditServiceProvider"
-            ],
-            "aliases": {
-                "Auditor": "Jiannius\\Audit\\Facades\\Auditor"
-            }
+            ]
         }
     },
     "scripts": {
