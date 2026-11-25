@@ -850,14 +850,17 @@ public function assertNotAudited(Model $model, string $event): void;
 - `->toBase()->(update|delete|insert)`;
 - a static mass write: `Model::insert(`, `insertOrIgnore(`, `insertGetId(`, `insertUsing(`, `upsert(` and `truncate(`;
 - pivot writes: `sync`, `syncWithoutDetaching`, `syncWithPivotValues`, `attach`, `detach`, `toggle`, `updateExistingPivot`;
-- a method chain ending in `update`, `delete`, `forceDelete`, `insert`, `insertOrIgnore`, `upsert`, `increment` or `decrement`;
+- a method chain ending in `update`, `delete`, `forceDelete`, `insert`, `insertOrIgnore`, `upsert`, `increment`, `decrement`, `restore` or `touch`: `Order::where(...)->update(...)`, `$invoice->lines()->delete()`, `Order::onlyTrashed()->restore()`. These are mass writes with no model events. The chain is **not** flagged when the call just before the write returns a model (`find`, `findOrFail`, `first`, `firstOrFail`, `sole`, `fresh`, `refresh`, `user`, `create`, `firstOrCreate`, `updateOrCreate`, `firstWhere`), because `Order::find(1)->delete()`, `$request->user()->update([...])` and `auth()->user()->update([...])` fire events, or when it starts at `Storage::`, `Http::`, `Cache::`, `Session::`, `Redis::` or `Mail::`, which are not queries;
+- raw PDO access: `getPdo()->exec(` and `getPdo()->prepare(` (also `getRawPdo()`);
 - any write through the `Audit` model (or your `audit.model` subclass).
 
-A statement is **not** flagged when it goes through `Auditor::update(`, `Auditor::delete(` or `Auditor::pivot(` (nor are the statements inside a closure you pass to one of them), through `updateQuietlyWithAudit(`, or through `->audit(`. Comments and the contents of strings never match. `Auditor::withSource()` and `Auditor::actingAs()` do not sanction what they wrap: a raw write inside them is still flagged.
+A statement is **not** flagged when it goes through `Auditor::update(`, `Auditor::delete(` or `Auditor::pivot(` (nor are **any** of the statements inside a closure you pass to one of them: a raw write in there is sanctioned along with the audited one), through `updateQuietlyWithAudit(`, or through `->audit(`. Comments and the contents of strings never match. `Auditor::withSource()` and `Auditor::actingAs()` do not sanction what they wrap: a raw write inside them is still flagged.
+
+The pivot rule is deliberately broad: `->attach(`, `->detach(`, `->toggle(` and `->sync(` are flagged wherever they appear, so a mail message's `$message->attach($file)` needs an allowlist line.
 
 It reads Blade files too, including Livewire and Volt single-file components: the `<?php ... ?>` block is tokenised as it is, and the code in `@php` blocks, in directive arguments and in `{{ }}` and `{!! !!}` echoes is read out of the HTML. Blade comments and `@verbatim` blocks are skipped.
 
-**The allowlist.** Each entry is `['file', 'contains', 'reason']`: the file relative to the base path, text that appears in the statement as written (comments left out, whitespace collapsed to single spaces), and why the write needs no audit row. An entry without a reason is an error.
+**The allowlist.** Each entry is `['file', 'contains', 'reason']`: the file relative to the base path, text that appears in the statement as written (comments left out, whitespace collapsed to single spaces), and why the write needs no audit row. The text of a double-quoted string with interpolation, and of a heredoc, is not kept (they read as `"…"`), so `contains` cannot match inside them: pick text from the code around. An entry without a reason is an error.
 
 ```php
 // tests/Fixtures/audit/raw-writes.php
@@ -868,8 +871,9 @@ return [
 
 - A failure lists each write as `file:line`, the statement, and an allowlist line to paste in once you have decided it is deliberate.
 - An entry that matches no flagged statement (the write was fixed, moved or deleted) fails too, so the allowlist cannot rot.
-- A path that does not exist throws, because reading nothing would pass. `vendor`, `node_modules` and `storage` directories under a path are skipped.
-- It is **biased towards false positives**: one allowlist line with a reason costs little. It cannot see dynamic calls such as `$query->{$method}()`, a write that a helper hides, or a query built in a variable and written on a later line (`$query->update([...])` is not recognised, as `$order->update([...])` on a model is fine).
+- A path that does not exist throws, because reading nothing would pass. The directories `vendor`, `node_modules` and `storage` are skipped, but only when they sit at the top of the base path (so `paths(['.'])` does not read your dependencies, and `app/Storage` is read); a failure message names the directories it did not read. Change the list with `skipDirectories(['vendor', 'storage/framework'])`, and read it back with `skipped()`.
+- It runs without a booted application (a bare PHPUnit test works): it then assumes the package's own `Audit` model rather than reading `audit.model`.
+- It is **biased towards false positives**: one allowlist line with a reason costs little. It cannot see dynamic calls such as `$query->{$method}()`, or a write that a helper hides. It cannot follow a query held in a variable either: after `$query = Order::where('a', 1);`, the statement `$query->update([...])` is not flagged, because it looks exactly like the model call `$order->update([...])`, which fires events and is fine.
 - `writes()` returns every flagged statement and `check()` returns the violations and the stale entries, if you want to report them your own way.
 
 **`AuditCoverage`** finds your models by path: `app/Models/Billing/Invoice.php` is `App\Models\Billing\Invoice` (PSR-4). Abstract classes, traits, classes that are not Eloquent models and custom `Pivot` and `MorphPivot` models (which are audited through `Auditor::pivot()` on the relation's parent, not by the trait) are skipped.

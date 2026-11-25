@@ -89,6 +89,13 @@ describe('what it flags', function () {
         'a chain ending in insertOrIgnore' => ["Order::query()->insertOrIgnore([['a' => 1]]);", 'a query chain ending in a write'],
         'a chain ending in increment' => ["Order::where('id', 1)->increment('n');", 'a query chain ending in a write'],
         'a chain with a closure that has a body' => ["Order::where(function (\$q) {\n    \$q->where('a', 1);\n})->update(['b' => 2]);", 'a query chain ending in a write'],
+        'a bulk restore' => ['Order::onlyTrashed()->restore();', 'a query chain ending in a write'],
+        'a bulk touch' => ["Order::where('a', 1)->touch();", 'a query chain ending in a write'],
+        'a write after a model call, on its relation' => ['Order::find(1)->items()->delete();', 'a query chain ending in a write'],
+        'getPdo exec' => ["DB::getPdo()->exec('delete from t');", 'raw PDO access'],
+        'getPdo prepare' => ["\$connection->getPdo()->prepare('delete from t');", 'raw PDO access'],
+        'a connection PDO exec' => ["DB::connection('tenant')->getPdo()->exec('delete from t');", 'raw PDO access'],
+        'getRawPdo' => ["\$db->getRawPdo()->exec('x');", 'raw PDO access'],
         'a static mass insert' => ["Order::insert([['a' => 1]]);", 'a static mass write'],
         'a static upsert' => ["Order::upsert([['a' => 1]], ['a']);", 'a static mass write'],
         'a static truncate' => ['Order::truncate();', 'a static mass write'],
@@ -99,6 +106,42 @@ describe('what it flags', function () {
         'an Audit instance saved' => ["(new Audit(['event' => 'x']))->save();", 'a write through the Audit model'],
         'a write through the model inside a withSource closure body' => ["Auditor::withSource('backfill:x', function () {\n    Order::where('a', 1)->update(['b' => 2]);\n});", 'a query chain ending in a write'],
         'a quiet save inside actingAs' => ['Auditor::actingAs($user, fn () => $invoice->saveQuietly());', 'a *Quietly() call or withoutEvents()'],
+    ]);
+
+    it('does not flag the common idioms that only look like query writes', function (string $statement) {
+        expect(guardOver("        {$statement}")->writes())->toBe([]);
+    })->with([
+        'find then delete' => ['Order::find(1)->delete();'],
+        'findOrFail then update' => ["Order::findOrFail(\$id)->update(['a' => 1]);"],
+        'the request user' => ["\$request->user()->update(['a' => 1]);"],
+        'the auth helper user' => ["auth()->user()->update(['a' => 1]);"],
+        'fresh' => ["\$order->fresh()->update(['a' => 1]);"],
+        'refresh' => ['$order->refresh()->delete();'],
+        'first' => ["Order::where('a', 1)->first()->delete();"],
+        'firstOrFail' => ["Order::where('a', 1)->firstOrFail()->update(['a' => 2]);"],
+        'sole' => ["Order::where('a', 1)->sole()->delete();"],
+        'create' => ["Order::create(['a' => 1])->update(['a' => 2]);"],
+        'firstOrCreate' => ["Order::firstOrCreate(['a' => 1])->update(['b' => 2]);"],
+        'updateOrCreate' => ["Order::updateOrCreate(['a' => 1])->touch();"],
+        'firstWhere' => ["Order::firstWhere('a', 1)->delete();"],
+        'a relation, then first' => ['Order::find(1)->items()->first()->delete();'],
+        'a nullsafe call' => ['Order::find(1)?->delete();'],
+        'a storage disk' => ["Storage::disk('s3')->delete('a.txt');"],
+        'a fully qualified storage' => ["\\Illuminate\\Support\\Facades\\Storage::disk('s3')->delete('a.txt');"],
+        'an http call' => ['Http::withToken($token)->delete($url);'],
+        'the cache' => ["Cache::store('file')->delete('key');"],
+        'the session' => ["Session::driver('array')->delete('key');"],
+        'redis' => ["Redis::connection('cache')->delete('key');"],
+        'mail' => ['Mail::mailer("smtp")->touch();'],
+    ]);
+
+    it('still flags what a facade or a model call does not explain', function (string $statement) {
+        expect(guardOver("        {$statement}")->writes())->toHaveCount(1);
+    })->with([
+        'a mail attachment, which an allowlist line covers' => ['$message->attach($file);'],
+        'a toggle' => ['$post->likes()->toggle([1]);'],
+        'a query that merely mentions a facade' => ["Order::where('disk', Storage::path('x'))->delete();"],
+        'a chain from a variable' => ["\$order->items()->where('a', 1)->delete();"],
     ]);
 
     it('reports the line of the statement, even when it spans several lines', function () {
@@ -313,11 +356,10 @@ describe('paths', function () {
             ->toThrow(InvalidArgumentException::class, 'resources/views');
     });
 
-    it('reads a single file, a directory recursively, and skips vendor', function () {
+    it('reads a single file and a directory recursively', function () {
         $root = guardSandbox([
             'app/A.php' => "<?php\n\$a->saveQuietly();\n",
             'app/Deep/Er/B.php' => "<?php\n\$b->saveQuietly();\n",
-            'app/vendor/C.php' => "<?php\n\$c->saveQuietly();\n",
             'app/notes.txt' => '$d->saveQuietly();',
             'routes/web.php' => "<?php\n\$e->saveQuietly();\n",
         ]);
@@ -352,5 +394,69 @@ describe('statements', function () {
 
         expect(array_column($statements, 'line'))->toContain(2, 3, 5)
             ->and(array_column($statements, 'text'))->toContain("Order::where('',1)->delete()");
+    });
+});
+
+describe('skipped directories', function () {
+    function skipSandbox(): string
+    {
+        return guardSandbox([
+            'app/A.php' => "<?php\n\$a->saveQuietly();\n",
+            'app/vendor/E.php' => "<?php\n\$e->saveQuietly();\n",
+            'app/storage/F.php' => "<?php\n\$f->saveQuietly();\n",
+            'vendor/pkg/B.php' => "<?php\n\$b->saveQuietly();\n",
+            'node_modules/x/C.php' => "<?php\n\$c->saveQuietly();\n",
+            'storage/framework/D.php' => "<?php\n\$d->saveQuietly();\n",
+        ]);
+    }
+
+    it('skips them at the top of the base path only, not deeper in the tree', function () {
+        $guard = RawWriteGuard::for(skipSandbox())->paths(['.']);
+
+        expect(array_column($guard->writes(), 'file'))->toBe(['app/A.php', 'app/storage/F.php', 'app/vendor/E.php'])
+            ->and($guard->skipped())->toEqualCanonicalizing(['vendor', 'node_modules', 'storage']);
+    });
+
+    it('does not skip a directory inside app that happens to be called vendor', function () {
+        $guard = RawWriteGuard::for(skipSandbox())->paths(['app']);
+
+        expect(array_column($guard->writes(), 'file'))->toBe(['app/A.php', 'app/storage/F.php', 'app/vendor/E.php'])
+            ->and($guard->skipped())->toBe([]);
+    });
+
+    it('skips what it is told to, and nothing else', function () {
+        $none = RawWriteGuard::for(skipSandbox())->paths(['.'])->skipDirectories([]);
+        $one = RawWriteGuard::for(skipSandbox())->paths(['.'])->skipDirectories(['storage/framework', 'vendor']);
+
+        expect($none->writes())->toHaveCount(6)
+            ->and(array_column($one->writes(), 'file'))->toBe(['app/A.php', 'app/storage/F.php', 'app/vendor/E.php', 'node_modules/x/C.php']);
+    });
+
+    it('reads a skipped directory when it is the path asked for', function () {
+        $guard = RawWriteGuard::for(skipSandbox())->paths(['vendor/pkg']);
+
+        expect(array_column($guard->writes(), 'file'))->toBe(['vendor/pkg/B.php']);
+    });
+
+    it('names the skipped directories when it fails', function () {
+        $guard = RawWriteGuard::for(skipSandbox())->paths(['.'])->skipDirectories(['vendor', 'storage']);
+
+        try {
+            $guard->assertClean();
+            test()->fail('It should have failed.');
+        } catch (AssertionFailedError $e) {
+            expect($e->getMessage())->toContain('Not read: storage/, vendor/')->toContain('skipDirectories()');
+        }
+    });
+});
+
+describe('outside a Laravel app', function () {
+    it('falls back to the package model without a container, so a bare PHPUnit test works', function () {
+        $root = guardSandbox(['app/A.php' => "<?php\n\\Jiannius\\Audit\\Audit::create(['event' => 'x']);\n\$order->saveQuietly();\n"]);
+        $script = $root.'/run.php';
+
+        file_put_contents($script, '<?php require '.var_export(realpath(__DIR__.'/../../vendor/autoload.php'), true).'; echo json_encode(array_column(Jiannius\Audit\Testing\RawWriteGuard::for('.var_export($root, true).')->paths(["app"])->writes(), "line"));');
+
+        expect(shell_exec(escapeshellarg(PHP_BINARY).' '.escapeshellarg($script).' 2>&1'))->toBe('[2,3]');
     });
 });

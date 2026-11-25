@@ -3,10 +3,12 @@
 namespace Jiannius\Audit\Testing;
 
 use InvalidArgumentException;
+use Jiannius\Audit\Audit;
 use PHPUnit\Framework\Assert;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use SplFileInfo;
+use Throwable;
 
 /**
  * A test that fails on every write that skips model events and is not audited, and on allowlist
@@ -26,16 +28,33 @@ final class RawWriteGuard
     /** A statement through one of these is an audited write. */
     private const SANCTIONED = '/\bAuditor::(?:update|delete|pivot)\(|\$auditor->(?:update|delete|pivot)\(|\bupdateQuietlyWithAudit\(|->audit\(/i';
 
-    /** Directories nobody means to scan. */
-    private const SKIPPED_DIRECTORIES = ['vendor', 'node_modules', 'storage'];
+    /** Directories nobody means to scan, when they sit at the top level of the base path. */
+    private const DEFAULT_SKIPPED = ['vendor', 'node_modules', 'storage'];
 
-    private const WRITES = 'insert\w*|update\w*|upsert|delete|forceDelete|truncate|increment\w*|decrement\w*';
+    private const WRITES = 'insert\w*|update\w*|upsert|delete|forceDelete|truncate|increment\w*|decrement\w*|restore|touch';
+
+    /**
+     * A chain `X->update()` is not a query write when X is a model: these calls return one (or the signed-in
+     * user), and `$model->update()` fires the model's events.
+     */
+    private const MODEL_RETURNING = ['find', 'findorfail', 'first', 'firstorfail', 'sole', 'fresh', 'refresh', 'user', 'create', 'firstorcreate', 'updateorcreate', 'firstwhere'];
+
+    /** A chain that starts at one of these facades is not an Eloquent query: a file, an HTTP call, a cache key. */
+    private const NOT_QUERY_ROOTS = ['Storage', 'Http', 'Cache', 'Session', 'Redis', 'Mail'];
 
     /** @var list<string> */
     private array $paths = [];
 
     /** @var list<array{file: string, contains: string, reason: string}> */
     private array $allowed = [];
+
+    /** @var list<string> */
+    private array $skip = self::DEFAULT_SKIPPED;
+
+    /** @var array<string, true> the skipped directories that were met while reading */
+    private array $skipped = [];
+
+    private ?string $models = null;
 
     private function __construct(private readonly string $basePath) {}
 
@@ -55,6 +74,33 @@ final class RawWriteGuard
         $this->paths = array_values($paths);
 
         return $this;
+    }
+
+    /**
+     * Directories not to read, by their path relative to the base path ('vendor', 'storage/framework'): only
+     * the ones that start at the top of the base path count. Default: vendor, node_modules and storage. The
+     * ones met while reading are named in a failure message, and by skipped().
+     *
+     * @param  list<string>  $directories
+     */
+    public function skipDirectories(array $directories): self
+    {
+        $this->skip = array_values(array_map(fn (string $directory) => trim(str_replace('\\', '/', $directory), '/'), $directories));
+
+        return $this;
+    }
+
+    /**
+     * The directories left unread because they are skipped, as relative paths.
+     *
+     * @return list<string>
+     */
+    public function skipped(): array
+    {
+        $skipped = array_keys($this->skipped);
+        sort($skipped);
+
+        return $skipped;
     }
 
     /**
@@ -92,6 +138,8 @@ final class RawWriteGuard
     public function writes(): array
     {
         $writes = [];
+        $this->skipped = [];
+        $this->models = null;
 
         foreach ($this->files() as $file) {
             $source = (string) file_get_contents($this->basePath.'/'.$file);
@@ -161,7 +209,7 @@ final class RawWriteGuard
             return [];
         }
 
-        $models = implode('|', array_map('preg_quote', array_unique(['Audit', class_basename((string) config('audit.model', 'Audit'))])));
+        $models = $this->modelNames();
         $writes = self::WRITES;
 
         $rules = [
@@ -171,11 +219,142 @@ final class RawWriteGuard
             'toBase() followed by a write' => '/->toBase\(\)->(?:update|delete|insert)\w*\(/i',
             'a pivot write' => '/->(?:sync|syncWithoutDetaching|syncWithPivotValues|attach|detach|toggle|updateExistingPivot)\(/i',
             'a static mass write' => '/::(?:insert|insertOrIgnore|insertGetId|insertUsing|upsert|truncate)\(/i',
-            'a query chain ending in a write' => "/\\)\\s*(?:\\?->|->)(?:{$writes})\\(/i",
+            'raw PDO access' => '/(?:->|::)(?:getPdo|getRawPdo)\\(\\)->(?:exec|prepare)\\(/i',
             'a write through the Audit model' => "/\\b(?:{$models})::.*?\\b(?:create|forceCreate|firstOrCreate|updateOrCreate|{$writes}|destroy|save\\w*)\\(|\\bnew\\s+(?:{$models})\\b.*->save\\w*\\(/s",
         ];
 
-        return array_keys(array_filter($rules, fn (string $pattern) => preg_match($pattern, $text) === 1));
+        $matched = array_keys(array_filter($rules, fn (string $pattern) => preg_match($pattern, $text) === 1));
+
+        if ($this->endsInQueryWrite($text)) {
+            $matched[] = 'a query chain ending in a write';
+        }
+
+        return $matched;
+    }
+
+    /** The class names a write through the Audit model can be spelled with: the package's, and the host's subclass. */
+    private function modelNames(): string
+    {
+        if ($this->models !== null) {
+            return $this->models;
+        }
+
+        // Without a container (a bare PHPUnit test) there is no config: the package's own model it is.
+        try {
+            $configured = config('audit.model');
+        } catch (Throwable) {
+            $configured = null;
+        }
+
+        $configured = is_string($configured) && $configured !== '' ? $configured : Audit::class;
+
+        return $this->models = implode('|', array_map('preg_quote', array_unique(['Audit', class_basename($configured)])));
+    }
+
+    /**
+     * Whether the statement has a `)->update(`-style call that is a query write: the call before it is not
+     * one that returns a model, and the chain does not start at a facade that is not a query.
+     */
+    private function endsInQueryWrite(string $text): bool
+    {
+        $writes = self::WRITES;
+
+        if (preg_match_all("/\\)\\s*(?:\\?->|->)(?:{$writes})\\(/i", $text, $matches, PREG_OFFSET_CAPTURE) === 0) {
+            return false;
+        }
+
+        foreach ($matches[0] as [, $offset]) {
+            $chain = self::chainBefore($text, $offset);
+
+            if ($chain !== [] && in_array(strtolower((string) end($chain)), self::MODEL_RETURNING, true)) {
+                continue;
+            }
+
+            if ($chain !== [] && in_array($chain[0], self::NOT_QUERY_ROOTS, true)) {
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * The names in the chain that ends at the `)` at $position, root first: `Order::where(...)->limit(3)` is
+     * [Order, where, limit], `$request->user()` is [$request, user], `auth()->user()` is [auth, user].
+     *
+     * @return list<string>
+     */
+    private static function chainBefore(string $text, int $position): array
+    {
+        $names = [];
+        $word = '/[\w$\\\\]/';
+
+        while (($text[$position] ?? null) === ')') {
+            $depth = 0;
+
+            for ($open = $position; $open >= 0; $open--) {
+                $depth += $text[$open] === ')' ? 1 : ($text[$open] === '(' ? -1 : 0);
+
+                if ($depth === 0) {
+                    break;
+                }
+            }
+
+            if ($open < 0) {
+                break;
+            }
+
+            $start = $open;
+
+            while ($start > 0 && preg_match($word, $text[$start - 1]) === 1) {
+                $start--;
+            }
+
+            $names[] = self::lastSegment(substr($text, $start, $open - $start));
+
+            if (substr($text, max(0, $start - 3), 3) === '?->') {
+                $position = $start - 4;
+            } elseif (substr($text, max(0, $start - 2), 2) === '->') {
+                $position = $start - 3;
+            } elseif (substr($text, max(0, $start - 2), 2) === '::') {
+                $end = $start - 2;
+                $from = $end;
+
+                while ($from > 0 && preg_match($word, $text[$from - 1]) === 1) {
+                    $from--;
+                }
+
+                $names[] = self::lastSegment(substr($text, $from, $end - $from));
+
+                break;
+            } else {
+                break;
+            }
+
+            if (($text[$position] ?? null) !== ')') {
+                $from = $position + 1;
+
+                while ($from > 0 && preg_match($word, $text[$from - 1]) === 1) {
+                    $from--;
+                }
+
+                $names[] = self::lastSegment(substr($text, $from, $position + 1 - $from));
+
+                break;
+            }
+        }
+
+        return array_reverse($names);
+    }
+
+    /** `\Illuminate\Support\Facades\Storage` is `Storage`. */
+    private static function lastSegment(string $name): string
+    {
+        $position = strrpos($name, '\\');
+
+        return $position === false ? $name : substr($name, $position + 1);
     }
 
     /** @return list<string> files relative to the base path, in a stable order */
@@ -187,7 +366,7 @@ final class RawWriteGuard
             $absolute = str_starts_with($path, '/') ? $path : $this->basePath.'/'.$path;
 
             if (is_file($absolute)) {
-                $files[] = $absolute;
+                $files[] = (string) realpath($absolute);
 
                 continue;
             }
@@ -196,15 +375,27 @@ final class RawWriteGuard
                 throw new InvalidArgumentException("RawWriteGuard path [{$path}] does not exist under [{$this->basePath}]. A path that is not there would let the guard pass without reading anything.");
             }
 
+            $requested = trim(str_replace('\\', '/', $this->relative((string) realpath($absolute))), '/').'/';
             $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($absolute, RecursiveDirectoryIterator::SKIP_DOTS));
 
             /** @var SplFileInfo $file */
             foreach ($iterator as $file) {
-                $skipped = array_intersect(explode('/', str_replace('\\', '/', substr($file->getPath(), strlen($absolute)))), self::SKIPPED_DIRECTORIES);
-
-                if ($file->isFile() && $file->getExtension() === 'php' && $skipped === []) {
-                    $files[] = $file->getPathname();
+                if (! $file->isFile() || $file->getExtension() !== 'php') {
+                    continue;
                 }
+
+                $relative = $this->relative((string) $file->getRealPath());
+
+                // Only the top of the base path is skipped, and not when the path asked for is itself inside the skipped directory.
+                foreach ($this->skip as $directory) {
+                    if (str_starts_with($relative, $directory.'/') && ! str_starts_with($requested, $directory.'/')) {
+                        $this->skipped[$directory] = true;
+
+                        continue 2;
+                    }
+                }
+
+                $files[] = (string) $file->getRealPath();
             }
         }
 
@@ -217,7 +408,7 @@ final class RawWriteGuard
     private function relative(string $file): string
     {
         $file = str_replace('\\', '/', $file);
-        $base = str_replace('\\', '/', $this->basePath).'/';
+        $base = str_replace('\\', '/', (string) (realpath($this->basePath) ?: $this->basePath)).'/';
 
         return str_starts_with($file, $base) ? substr($file, strlen($base)) : $file;
     }
@@ -264,6 +455,11 @@ final class RawWriteGuard
             foreach ($stale as $entry) {
                 $lines[] = "  {$entry['file']}  contains: {$entry['contains']}  (reason: {$entry['reason']})";
             }
+        }
+
+        if ($this->skipped !== []) {
+            $lines[] = '';
+            $lines[] = 'Not read: '.implode(', ', array_map(fn (string $directory) => $directory.'/', $this->skipped())).' (skipped at the top of the base path; change it with skipDirectories()).';
         }
 
         return "RawWriteGuard failed.\n\n".implode("\n", $lines);
