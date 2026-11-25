@@ -2,11 +2,15 @@
 
 namespace Jiannius\Audit;
 
+use Cron\CronExpression;
 use Illuminate\Console\Events\CommandFinished;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskStarting;
+use Illuminate\Console\Scheduling\Event as ScheduledEvent;
+use Illuminate\Console\Scheduling\ManagesFrequencies;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Foundation\CachesConfiguration;
 use Illuminate\Log\Context\Repository as ContextRepository;
 use Illuminate\Queue\Events\JobExceptionOccurred;
@@ -17,7 +21,13 @@ use Illuminate\Routing\Events\RouteMatched;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
+use InvalidArgumentException;
+use Jiannius\Audit\Console\PruneCommand;
+use Jiannius\Audit\Console\PurgeCommand;
 use Jiannius\Audit\Context\AuditContext;
+use Jiannius\Audit\Contracts\FormatsAuditValues;
+use ReflectionClass;
+use ReflectionMethod;
 
 class AuditServiceProvider extends ServiceProvider
 {
@@ -29,6 +39,9 @@ class AuditServiceProvider extends ServiceProvider
         $this->app->singleton(Recorder::class);
         $this->app->singleton(AuditObserver::class);
         $this->app->singleton(Auditor::class);
+
+        // The formatter the CSV export uses unless it is given another. Rebind it to swap it in one place.
+        $this->app->bind(FormatsAuditValues::class, fn ($app) => $app->make(config('audit.formatter')));
     }
 
     public function boot(): void
@@ -46,11 +59,61 @@ class AuditServiceProvider extends ServiceProvider
             $this->publishesMigrations([
                 __DIR__.'/../database/migrations/create_audits_table.php.stub' => $target,
             ], 'audit-migrations');
+
+            $this->commands([PruneCommand::class, PurgeCommand::class]);
         }
 
         $this->registerContextHooks();
         $this->registerSourceListeners();
         $this->registerSignInListeners();
+        $this->registerPruneSchedule();
+    }
+
+    /**
+     * Schedule `audit:prune` from `audit.prune.schedule`, so the host only needs `schedule:run` in cron.
+     * The config is read when the schedule is resolved, so a cached config is honoured and `null` schedules nothing.
+     */
+    private function registerPruneSchedule(): void
+    {
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
+            $frequency = config('audit.prune.schedule');
+
+            if ($frequency === null || $frequency === false) {
+                return;
+            }
+
+            $event = $schedule->command('audit:prune')->withoutOverlapping();
+
+            static::applyFrequency($event, $frequency);
+        });
+    }
+
+    /** A frequency method that takes no arguments (`daily`, `hourly`, `weekly`), or a cron expression. */
+    private static function applyFrequency(ScheduledEvent $event, mixed $frequency): void
+    {
+        if (! is_string($frequency) || trim($frequency) === '') {
+            throw new InvalidArgumentException('audit.prune.schedule must be a frequency method such as [daily], a cron expression, or null.');
+        }
+
+        $frequency = trim($frequency);
+
+        if (preg_match('/^[A-Za-z]+$/', $frequency) === 1) {
+            $method = (new ReflectionClass(ManagesFrequencies::class))->hasMethod($frequency) ? new ReflectionMethod(ManagesFrequencies::class, $frequency) : null;
+
+            if ($method === null || ! $method->isPublic() || $method->getNumberOfRequiredParameters() > 0) {
+                throw new InvalidArgumentException("audit.prune.schedule [{$frequency}] is not a schedule frequency method that takes no arguments. Use one such as [daily] or [hourly], or a cron expression.");
+            }
+
+            $event->{$frequency}();
+
+            return;
+        }
+
+        if (class_exists(CronExpression::class) && ! CronExpression::isValidExpression($frequency)) {
+            throw new InvalidArgumentException("audit.prune.schedule [{$frequency}] is not a valid cron expression.");
+        }
+
+        $event->cron($frequency);
     }
 
     /** Carry the actor and request id into queued jobs through hidden Context. */
