@@ -215,9 +215,11 @@ describe('queue', function () {
             ->and($jobs->pluck('actor_name')->all())->toBe(['Ada Lovelace', 'Grace Hopper']);
     });
 
-    it('still falls back to the guard for a job that carries no origin', function () {
-        makeUser();
+    it('credits nobody for a job that carries no origin, even with a stale user on the guard', function () {
+        $bob = makeUser(['name' => 'Bob', 'email' => 'bob@example.test', 'username' => 'bob']);
+        $this->actingAs($bob); // left on the worker's guard by an earlier job
 
+        // A job pushed from outside Laravel: a payload with no Context at all.
         DB::table('jobs')->insert([
             'queue' => 'default',
             'payload' => json_encode([
@@ -225,7 +227,7 @@ describe('queue', function () {
                 'displayName' => RecordActorJob::class,
                 'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
                 'maxTries' => null, 'maxExceptions' => null, 'failOnTimeout' => false, 'backoff' => null, 'timeout' => null,
-                'data' => ['commandName' => RecordActorJob::class, 'command' => serialize(new RecordActorJob('external'))],
+                'data' => ['commandName' => RecordActorJob::class, 'command' => serialize(new RecordActorJob('external', loginAs: $bob->id))],
             ]),
             'attempts' => 0, 'reserved_at' => null, 'available_at' => now()->timestamp, 'created_at' => now()->timestamp,
         ]);
@@ -237,6 +239,37 @@ describe('queue', function () {
         expect($job->actor_id)->toBeNull()
             ->and($job->source)->toBe('queue:'.RecordActorJob::class)
             ->and($job->request_id)->toHaveLength(26);
+    });
+
+    it('still uses the guard for work that runs without queue events', function () {
+        $ada = makeUser();
+        $this->actingAs($ada);
+
+        RecordNowJob::dispatchSync();
+
+        expect($this->audits()->sole()->actor_id)->toBe((string) $ada->id);
+    });
+
+    it('still honours the context key inside a job with no origin', function () {
+        $ada = makeUser();
+        config(['audit.actor.context_key' => 'acting_user_id']);
+
+        DB::table('jobs')->insert([
+            'queue' => 'default',
+            'payload' => json_encode([
+                'uuid' => 'external-2',
+                'displayName' => RecordActorJob::class,
+                'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+                'maxTries' => null, 'maxExceptions' => null, 'failOnTimeout' => false, 'backoff' => null, 'timeout' => null,
+                'data' => ['commandName' => RecordActorJob::class, 'command' => serialize(new RecordActorJob('external'))],
+                'illuminate:log:context' => ['data' => ['acting_user_id' => serialize($ada->id)], 'hidden' => []],
+            ]),
+            'attempts' => 0, 'reserved_at' => null, 'available_at' => now()->timestamp, 'created_at' => now()->timestamp,
+        ]);
+
+        Artisan::call('queue:work', ['--once' => true]);
+
+        expect($this->audits()->sole()->actor_id)->toBe((string) $ada->id);
     });
 
     it('does not break a dispatch when the signed-in user cannot be snapshotted', function () {

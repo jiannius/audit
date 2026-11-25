@@ -77,8 +77,11 @@ class Recorder
             $this->connectionFor($audit->subject)->table($table)->insert($row);
         } catch (QueryException $e) {
             // The original message carries the SQL with every binding: values, emails, IPs.
-            // Throw a new exception that holds none of it, and do not chain the original.
-            throw AuditWriteFailed::from($e, $table);
+            // Throw a new exception that holds none of it, do not chain the original, and
+            // do not pass it to a function that appears in the trace with its arguments.
+            [$sqlState, $driverCode, $retryable] = AuditWriteFailed::describe($e);
+
+            throw new AuditWriteFailed($table, $sqlState, $driverCode, $retryable);
         }
     }
 

@@ -317,7 +317,7 @@ Every row records who acted, where from, and in which request.
 **Actor.** The first match wins:
 
 1. An `Auditor::actingAs($user, fn () => ...)` override. `actingAs(null, ...)` means nobody.
-2. Inside a queued job: the origin carried from the process that dispatched it (below), even when that origin is nobody. The guard is **not** consulted inside a job, because a long-running worker keeps its guards between jobs, so a job that signed someone in would otherwise leak that user into the next job. A job that really does act as someone else says so with `actingAs`.
+2. Inside a queued job picked up by a worker: the origin carried from the process that dispatched it (below), even when that origin is nobody. The guard is **not** consulted inside a job, with or without a carried origin, because a long-running worker keeps its guards between jobs, so a user an earlier job signed in would otherwise be credited with this job's work. **Calling `Auth::login()` or `Auth::setUser()` inside a job does not change who the rows are attributed to; use `Auditor::actingAs()`.** A job pushed from outside Laravel, or queued before you installed the package, has no origin and is recorded as nobody (or the Context-key fallback below). Work that runs without queue events, such as `dispatchSync()` of a job that does not implement `ShouldQueue`, is not a queue frame and uses the guard as usual.
 3. The user signed in on the default guard. If the guard has not resolved its user yet, but the session already holds its login id, that user is looked up from the id. The package never calls `Auth::user()` and never reads the remember-me cookie, so recording a row cannot trigger a remember-cookie login, a `Login` event or any other side effect. A user known only from a remember cookie is recorded as nobody until your own code resolves them.
 4. A fallback: the user whose id is in the Context key named by `audit.actor.context_key`.
 5. Nobody, shown as "System".
@@ -465,7 +465,7 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 - An exception in a `saved` hook now rolls the save back when `transactional_saves` is on. Run your full suite when you adopt it; the config switch is the off ramp.
 - `Model::increment()` and `decrement()` do not call `save()`, so they are not wrapped.
 
-**What the exception holds.** A failed insert throws `Jiannius\Audit\Exceptions\AuditWriteFailed`. It carries the table name, the SQLSTATE and the driver's error code, and nothing else: the database exception's own message holds the full SQL with every bound value (labels, emails, IPs), so it is not chained as `previous`. It still propagates, so a surrounding transaction rolls back. An invalid category throws `InvalidArgumentException` before any insert.
+**What the exception holds.** A failed insert throws `Jiannius\Audit\Exceptions\AuditWriteFailed`. It carries the table name, the SQLSTATE and the driver's error code, and nothing else: the database exception's own message holds the full SQL with every bound value (labels, emails, IPs), so it is not chained as `previous`. It still propagates, so a surrounding transaction rolls back, and an error Laravel treats as retryable (a deadlock, a MySQL lock wait timeout, a busy SQLite file) stays retryable for `DB::transaction($callback, $attempts)`: the exception then also carries a canned phrase Laravel's concurrency detector recognises, never a value. An invalid category throws `InvalidArgumentException` before any insert.
 
 **Sanitising.** An awkward value must never block a legitimate save:
 
@@ -476,7 +476,7 @@ The audit write is **fail closed**: it is synchronous, never queued, and on the 
 - labels, source and identifiers are truncated to their column sizes, by character;
 - the user agent is stored as text, truncated to MySQL's 65,535 bytes without splitting a character.
 
-**The package never logs audit values**, and it never puts them in an exception message, so your error tracker never receives them from the package.
+**The package never logs audit values**, and the `AuditWriteFailed` message and its `previous` chain hold none. A stack trace is a separate matter: with `zend.exception_ignore_args=Off`, which is the development default, a trace records the arguments of every frame, including the values you passed to `Auditor::record()` and the `PendingAudit` the recorder handles, and an error tracker that serialises traces will receive them. Set `zend.exception_ignore_args=On` in production (it is the default in `php.ini-production`). The package avoids adding the database exception to the trace, but cannot remove your own call's arguments from it.
 
 **Id gaps.** An auto-increment `id` can skip numbers when a transaction rolls back after the row was inserted. A gap is not a deleted row.
 

@@ -42,13 +42,17 @@ class AuditContext
 
     /**
      * First match wins: an actingAs() override; inside a queued job, the origin
-     * carried from the dispatching process; the user signed in on the default
-     * guard; the configured Context key; then nobody.
+     * carried from the dispatching process, then the configured Context key;
+     * outside a job, the user signed in on the default guard (or in the
+     * session), the carried origin, then the Context key; then nobody.
      *
-     * Inside a job the guard is never consulted. A long-running worker keeps
-     * its guards between jobs, so a job that signed someone in would otherwise
-     * leak that user into the next job. A job that really does act as someone
-     * else says so with actingAs().
+     * Inside a job the guard is never consulted, with or without a carried
+     * origin. A long-running worker keeps its guards between jobs, so a user an
+     * earlier job signed in would otherwise be credited with this job's work,
+     * and a job pushed from outside Laravel has no one to blame. A job that
+     * really does act as someone else says so with actingAs(). Work that runs
+     * without queue events, such as dispatchSync() of a job that is not queued,
+     * is not a queue frame and uses the guard.
      */
     public function actor(): ?Actor
     {
@@ -58,8 +62,8 @@ class AuditContext
 
         $origin = $this->origin();
 
-        if ($this->inQueue() && array_key_exists('actor', $origin)) {
-            return Actor::fromArray($origin['actor']) ?? $this->actorFromContextKey();
+        if ($this->inQueue()) {
+            return Actor::fromArray($origin['actor'] ?? null) ?? $this->actorFromContextKey();
         }
 
         $guard = Auth::guard();
@@ -154,6 +158,12 @@ class AuditContext
         return $this->requestId ??= (string) Str::ulid();
     }
 
+    /**
+     * Set when a route matches. It is never reset: a PHP process serves HTTP or
+     * runs console, and Octane resets this scoped instance between requests.
+     * Only a test that serves a request and then runs console work in the same
+     * process sees it stay on; use startNewProcess() style resets there.
+     */
     public function markHttp(bool $http = true): void
     {
         $this->http = $http;
