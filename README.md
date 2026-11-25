@@ -285,7 +285,10 @@ Over two invoices, the last call writes these rows:
 - **The model's `auditEvents()` is respected for standard events.** `Auditor::update(...)` with the default `updated` writes no row for a model that records only `deleted`. A custom event name (`voided`, `cancelled`) is always recorded: you asked for it.
 - **Scopes apply.** An Eloquent builder or relation brings its global scopes, including soft deletes, so a trashed record is not updated or recorded.
 - **The primary key cannot be updated** through it: the rows could not be matched before and after. It throws `InvalidArgumentException`.
-- **Locks and memory.** The `lockForUpdate` select makes the call hold row locks until it commits, a little longer than a plain update. Keep very large updates in batches. The matching rows are read into memory once, and the re-read goes in chunks of 1,000 keys.
+- **A column qualified with the table or its alias** (`'invoices.total'`, `'i.total'`) is recorded as that column. A column qualified with anything else throws `InvalidArgumentException`: it could not be placed on the audited record, and skipping it would write a change with no row.
+- **Bulk writes bypass casts and mutators.** The table gets exactly what you pass: a `hashed` cast or a setter does not run. The audit still applies the model's redaction to what it stores.
+- **Locks and memory.** The select locks the matching rows, in primary key order, until the transaction commits: a little longer than a plain update. **The before-snapshot of every matched row is held in memory** (roughly the size of the rows), while the re-read, the comparison and the audit rows go in chunks of 1,000 keys. For a very large update, batch it yourself by key range (`whereBetween('id', [$from, $to])`, a few thousand rows at a time).
+- **The audited set must be the written set.** If the write affects more rows than were locked and snapshotted (a row that appeared in between under `READ COMMITTED`), it throws `RuntimeException` and rolls back: retry. A `limit()` or `offset()` on a query with joins (a many-to-many or has-many-through relation) is refused up front with `InvalidArgumentException`, because the database ignores the limit on a joined write. Select the keys first and use `whereKey()`.
 
 **A base query builder** (`DB::table()`) has no model, so it needs one:
 
@@ -321,11 +324,11 @@ Order::where('status', 'draft')->delete();
 Auditor::delete(Order::where('status', 'draft'));
 ```
 
-Each row has `old_values` (the full raw snapshot, filtered and redacted by the model's rules), no `new_values`, and `meta.soft`, as the model's own `delete()` records:
+Each row has `old_values` (the full raw row, filtered and redacted by the model's rules), no `new_values`, and `meta.soft`, in the shape the model's own `delete()` records. For a soft delete that is the row as the soft delete leaves it, so `deleted_at` holds the new timestamp, exactly as the observer's `deleted` row does: hosts see one shape whichever way a record was deleted. A hard delete records the row as it was.
 
-- On an **Eloquent builder or relation of a soft-deleting model** it **soft deletes**, as Laravel's builder does, and `meta.soft` is `true`. Trashed rows are not matched unless the builder says `withTrashed()`.
+- On an **Eloquent builder or relation of a soft-deleting model** it **soft deletes**, as Laravel's builder does, and `meta.soft` is `true`. Trashed rows are not matched unless the builder says `withTrashed()`; with it, already-trashed rows are soft deleted again (their `deleted_at` is rewritten, as Laravel's builder does) and a `deleted` row is recorded for them.
 - Otherwise (a model that does not soft delete, or a base query builder, which knows nothing about soft deletes) it hard deletes and `meta.soft` is `false`.
-- `event: 'force_deleted'` on a soft-deleting model deletes for good, trashed rows included, as `forceDelete()` does, and records `force_deleted` with no `soft` key.
+- `event: 'force_deleted'` on a soft-deleting model deletes for good, trashed rows included, and records `force_deleted` with no `soft` key. It drops the soft-delete scope **and only that one**: the model's other global scopes (a tenant scope, say) still apply. Laravel's own `forceDelete()` on a builder drops every global scope; this is deliberately safer.
 
 ### `updateQuietlyWithAudit()`
 
@@ -340,7 +343,7 @@ It fills the model, saves it without events, and records one row from `getPrevio
 ### Pivot changes
 
 ```php
-Auditor::pivot(BelongsToMany $relation, Closure $write, string $event = 'updated', array $meta = []): mixed;
+Auditor::pivot(BelongsToMany $relation, Closure $write, string $event = 'updated', array $meta = [], ?string $field = null): mixed;
 ```
 
 ```php
@@ -353,17 +356,18 @@ Auditor::pivot($user->teams(), fn (BelongsToMany $teams) => $teams->sync($teamId
 
 It reads the pivot rows before and after your closure, in one transaction, and returns what the closure returned. `attach`, `detach`, `sync`, `toggle`, `updateExistingPivot` or your own pivot queries all work. If the links are the same afterwards, **nothing is written**.
 
-The row is recorded **on the relation's parent** (the user above), and the field is named after the relation (`teams`). Its old and new value is the **whole set of links**, in one of two shapes:
+The row is recorded **on the relation's parent** (the user above), and the field is named after the relation (`teams`). That is the relation's method name when the package can tell it, else the related table's name; pass `field: 'teams'` to set it yourself. Its old and new value is the **whole set of links**, in one of two shapes:
 
 | The relation | The field's old and new value | Example |
 |---|---|---|
-| has no pivot columns | a list of the related ids, sorted | `{"teams": [1, 3]}` becomes `{"teams": [1, 2]}` |
-| declares pivot columns with `withPivot()` | a map of related id to its columns, sorted by id | `{"teams": {"1": {"role": "member"}}}` becomes `{"teams": {"1": {"role": "admin"}}}` |
+| has no pivot columns | a list of the related ids, sorted; an id linked twice appears twice | `{"teams": [1, 3]}` becomes `{"teams": [1, 2]}` |
+| declares pivot columns with `withPivot()` | a map of related id to its columns, sorted by id; an id linked twice maps to a list of its column sets | `{"teams": {"1": {"role": "member"}}}` becomes `{"teams": {"1": {"role": "admin"}}}` |
 
 - **Timestamps** (`withTimestamps()`) are left out, so touching `updated_at` alone is not a change.
 - **Excluded** pivot columns (`*_token` and the like) are left out, and **redacted** ones read `"[redacted]"`. A change to a redacted column is still seen as a change.
 - The parent's `auditEvents()` is checked for the default `updated` event, and the row uses the parent's `auditLabel()` and `auditParent()`.
-- The pivot rows are read with `lockForUpdate`, so two concurrent changes to the same parent's links serialise.
+- **Duplicate links** (a pivot table with no unique key, linked twice to the same record) are counted: `[1, 1, 2]`, and in the map form `{"1": [{"role": "admin"}, {"role": "member"}]}`, the column sets in JSON order. Adding a duplicate is a change and writes a row.
+- The existing pivot rows are read with `lockForUpdate`, so a concurrent change to a link that exists waits for yours. A link that does not exist yet has nothing to lock (the database may or may not take a gap lock), so two concurrent attaches of new links are not serialised.
 - The whole set is stored on both sides, so a relation with thousands of links gives large rows. For those, record the change as a custom event instead.
 
 ### Rules for all of them
