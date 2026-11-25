@@ -129,6 +129,7 @@ Every model that uses `Auditable` needs a morph-map alias ([section 2](#2-instal
 | `restored` | the changed keys (`deleted_at` before) | the changed keys (`deleted_at` after) | none |
 
 - Values are **raw database values**, read from the model's raw attributes and never through its casts: enums store their backing value, dates the database string, JSON columns the JSON string, integers stay integers.
+- A string value over `audit.max_value_bytes` is stored as the marker `"[truncated N bytes]"`, so a large attribute never blocks a save ([section 9](#9-failure-behaviour)).
 - `created` stores the attributes the model held when it was inserted. A column the database fills in by default is not in it.
 - `restore()` writes **one** `restored` row, not an extra `updated` one, and writes it inside the save, so it is as atomic as any other change.
 - `forceDelete()` writes one `force_deleted` row. It is recorded when `auditEvents()` lists `deleted` or `force_deleted`.

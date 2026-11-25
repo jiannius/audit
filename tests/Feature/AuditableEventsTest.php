@@ -339,3 +339,39 @@ describe('audits() and auditTrail()', function () {
             ->and($loaded[1]->audits)->toHaveCount(2);
     });
 });
+
+describe('oversize values', function () {
+    it('stores an attribute over the byte cap as a marker, and the save succeeds', function () {
+        config(['audit.max_value_bytes' => 100]);
+
+        $document = makeDocument(['options' => ['body' => str_repeat('x', 500)], 'notes' => str_repeat('n', 500)]);
+        $raw = $document->getAttributes()['options'];
+
+        $created = $this->audits()->sole();
+
+        expect(Document::query()->count())->toBe(1)
+            ->and($created->new_values['options'])->toBe('[truncated '.strlen($raw).' bytes]')
+            ->and($created->new_values['title'])->toBe('Quarterly report')
+            ->and($created->new_values['notes'])->toBe('[redacted]');
+
+        $document->update(['options' => ['body' => str_repeat('y', 600)]]);
+
+        $updated = $this->audits()->last();
+
+        expect($updated->old_values['options'])->toBe('[truncated '.strlen($raw).' bytes]')
+            ->and($updated->new_values['options'])->toStartWith('[truncated ');
+
+        $document->delete();
+
+        expect($this->audits()->last()->old_values['options'])->toStartWith('[truncated ')
+            ->and(DB::table('audits')->get()->map(fn ($row) => json_encode($row))->implode(''))->not->toContain('xxxxxxxx');
+    });
+
+    it('keeps the full value when the cap is off', function () {
+        config(['audit.max_value_bytes' => 0]);
+
+        $document = makeDocument(['options' => ['body' => str_repeat('x', 500)]]);
+
+        expect($this->audits()->sole()->new_values['options'])->toBe($document->getAttributes()['options']);
+    });
+});

@@ -4,6 +4,7 @@ use Illuminate\Database\ClassMorphViolationException;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Jiannius\Audit\Exceptions\AuditWriteFailed;
 use Jiannius\Audit\Tests\Fixtures\AuditedInvoice;
 use Jiannius\Audit\Tests\Fixtures\AuditedLine;
 use Jiannius\Audit\Tests\Fixtures\Document;
@@ -11,18 +12,20 @@ use Jiannius\Audit\Tests\Fixtures\LoggedDocument;
 use Jiannius\Audit\Tests\Fixtures\Unmapped;
 use Jiannius\Audit\Tests\Fixtures\UnwrappedDocument;
 
-/** The insert failure is a package exception; assert on any throwable, not on its class. */
+/** A failed audit insert is a package exception, and it carries none of the values being saved. */
 function expectFailure(Closure $callback): void
 {
-    $threw = false;
+    $failure = null;
 
     try {
         $callback();
-    } catch (Throwable) {
-        $threw = true;
+    } catch (Throwable $e) {
+        $failure = $e;
     }
 
-    expect($threw)->toBeTrue();
+    expect($failure)->toBeInstanceOf(AuditWriteFailed::class)
+        ->and($failure->getMessage())->not->toContain('Memo')
+        ->and($failure->getMessage())->not->toContain('insert into');
 }
 
 function dropAuditsTable(): void
